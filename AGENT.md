@@ -1,58 +1,30 @@
-# AGENT.md — micro_tamplate
+# AGENT.md — db-wrapper
 
-Backend microservice template: **ntex** (async web framework on compio),
-**redb** (embedded K/V database), **flatbuffers** (zero-copy serialisation).
+Embedded database crate: **redb** (shodh-redb) with in-memory atomic counters,
+unified write buffers, and read-through lookups.  No async runtime dependency.
 
 ---
 
 ## Project tree
 
 ```
-tamplate/
-├── build.rs                 # flatc codegen with caching
-├── Cargo.toml               # deps + compile-time log level features
-├── clippy.toml
-├── rustfmt.toml
-├── .env.example             # env reference (secrets/ → env → .env)
-├── AGENT.md                 # ← this file
+db-wrapper/
+├── Cargo.toml              # shodh-redb + log + thiserror
+├── AGENT.md                # ← this file
+├── README.md
 │
-├── flatbuffers/             # IDL schemas (source of truth)
-│   ├── dto/
-│   │   └── login.fbs        # LoginRequest / TokenResponse
-│   └── types/
-│       └── tokens.fbs       # RSTokens, Bytes21, Bytes11
+├── src/
+│   ├── lib.rs              # crate root: re-exports, db! macro
+│   ├── counter.rs          # CounterStore — lock-free AtomicU64[256] + blob persist
+│   ├── buffer.rs           # BufferStore — unified regular + TTL buffers
+│   ├── wrapper.rs          # DBWrapper — open, compact, backup, next, write, get_buffered
+│   └── error.rs            # DbError (Redb, Io, TableNotFound)
 │
-└── src/
-    ├── main.rs              # entrypoint: logger init, config, DB, server
-    ├── config.rs            # config! macro (secrets → env → .env)
-    ├── logging.rs           # stderr logger (compile-time level via features)
-    │
-    ├── bd/
-    │   └── mod.rs           # DBWrapper + WriteBuffer (redb)
-    │
-    ├── errors/
-    │   ├── mod.rs           # AppError (umbrella) + re-exports
-    │   ├── db.rs            # DbError
-    │   ├── config.rs        # ConfigError
-    │   └── auth.rs          # AuthError
-    │
-    ├── routes/
-    │   ├── mod.rs           # /v1 scope
-    │   └── auth/
-    │       ├── mod.rs       # /v1/auth scope
-    │       └── login.rs     # POST /v1/auth/login + #[test] manual test
-    │
-    ├── logic/
-    │   └── mod.rs           # business logic (auth, validation, …)
-    │
-    └── generated/           # flatc output — DO NOT EDIT
-        ├── mod.rs
-        ├── dto/
-        │   ├── mod.rs
-        │   └── login_generated.rs
-        └── types/
-            ├── mod.rs
-            └── tokens_generated.rs
+├── tests/
+│   └── integration.rs      # full lifecycle: write → flush → restore → verify
+│
+└── benches/
+    └── bench.rs            # hot path, during-flush, restore, read, buffer write
 ```
 
 ---
@@ -60,96 +32,104 @@ tamplate/
 ## Quick commands
 
 ```sh
-# Dev build (info+ logging)
+# Dev build
 cargo build
 
-# All logging levels
-cargo build --no-default-features --features log-trace
+# Tests (20 unit + 4 integration)
+cargo test
 
-# Production build (error only)
-cargo build --release --no-default-features --features log-error
+# Benchmarks
+cargo bench
 
 # Lint
 cargo clippy
 
 # Format
 cargo fmt
-
-# Manual test (start server first, then in another terminal)
-cargo test -- test_login_manual --nocapture
 ```
 
 ---
 
 ## Architecture
 
-### Web framework — ntex + compio
+### Counters — `CounterStore`
 
-- **ntex** v3 — async actor-less web framework (like actix-web but lighter).
-- Runs on **compio** (io-uring / IOCP), not tokio.
-- `#[ntex::main]` macro starts the compio runtime.
-- Service config uses `web::scope("/v1").service(auth::scope())`.
-
-### Database — redb (embedded)
-
-- **shodh-redb** v0.5 — fork of redb with TTL tables.
-- Single-file embedded K/V, no external process.
-- `DBWrapper` wraps `Arc<Database>` + write buffers.
-- Write buffers batch inserts by **size** or **time** (auto-flush).
-
-### Serialisation — FlatBuffers
-
-- Schema files live in `flatbuffers/` (IDL source of truth).
-- `build.rs` runs `flatc --rust` **only when schemas change** (hash cache in `OUT_DIR`).
-- Generated code lands in `src/generated/` (`.gitignore`d).
-- Patch step fixes `crate::` paths and adds `#![allow(…)]`.
-
-### Logging — compile-time level
-
-- Levels controlled by **Cargo features**, not runtime config.
-- `log-trace`, `log-debug`, `log-info` (default), `log-warn`, `log-error`, `log-off`.
-- Code **below** the chosen level is stripped by the compiler (zero runtime cost).
-- `trace!` = very detailed (buffer internals, serialisation).
-- `debug!` = developer info (buffer sizes, flush counts).
-- `info!` = operational milestones (startup, login, maintenance).
-- `warn!` = recoverable problems (missing config, force-flush TTL).
-- `error!` = failures (compaction fail, flush error).
-
-### Config — `config!` macro
+- **256 independent slots** (`u8` → `0..=255`), each backed by `AtomicU64`.
+- Hot path: `array[id].fetch_add(1, Relaxed) + 1` → ~8 ns, no locks, no hashing.
+- Persisted as a **single 2048-byte blob** under one key (`counter_blob`).
+- Flush skips write entirely if nothing changed since last flush.
 
 ```rust
-config!("DB_PATH")              // → Option<String>
-config!("BIND_ADDR", "127.0.0.1") // → String with default
+let id = db.next(0);  // → 1, 2, 3, …
+db.flush_counters()?; // write dirty counters to redb
 ```
 
-Priority: **secrets/ files → env vars → .env file** (first match wins).
+### Buffers — `BufferStore`
 
-### Errors — thiserror hierarchy
+- **Two unified buffers** (regular + TTL), not per-table.
+- All writes across all tables land in the same buffer.
+- **No background async tasks** — flush is triggered manually or by size threshold.
 
-```text
-AppError (umbrella)
-├── Db(#[from] DbError)
-├── Config(#[from] ConfigError)
-├── Auth(#[from] AuthError)
-├── Io(#[from] std::io::Error)
-├── Logger(#[from] SetLoggerError)
-├── Flatbuffer(#[from] InvalidFlatbuffer)
-└── Other(String)
+```rust
+db.register_table(MY_TABLE);       // once at startup
+db.write(MY_TABLE, key, value)?;   // → buffer
+db.flush_buffers()?;               // → redb
+
+// Read: buffer first, fall back to DB yourself
+if let Some(bytes) = db.get_buffered(MY_TABLE.name(), &key_bytes) {
+    // found in buffer
+}
 ```
 
-`main()` returns `Result<(), AppError>` — all `?` work transparently.
+### Auto-flush (OOM guard)
+
+- `BufferStore::push` auto-flushes when `len >= max_size` (default: 10 000).
+- Flush calls `on_flush` callback first → counters synced to disk alongside data.
+
+### Read-through
+
+- `get_buffered(table_name, key_bytes)` scans regular buffer → TTL buffer.
+- Returns `None` if not found — caller falls back to direct redb read via `db.db`.
+
+### Flush timing
+
+- Externally driven (caller spawns a timer loop).
+- Recommended: every 10 seconds (`BUFFER_FLUSH_SECS`).
+- Daily: compact + backup.
+
+```rust
+// In the host application's main loop:
+loop {
+    sleep(Duration::from_secs(BUFFER_FLUSH_SECS)).await;
+    db.flush_buffers()?;
+}
+```
+
+### Counters + buffers sync
+
+- `BufferStore` has an `on_flush` callback.
+- When buffers flush (manual or auto-max-size), counters flush first.
+- Result: counter values always hit disk before or with buffered data.
 
 ---
 
-## How to add a new endpoint
+## API summary
 
-1. **Define the schema** (if needed) — create `flatbuffers/dto/new_thing.fbs`.
-2. **Build** — `cargo build` regenerates `src/generated/`.
-3. **Add a handler** — create `src/routes/new_module/action.rs`.
-4. **Wire the route** — register in the parent `mod.rs`.
-5. **Add errors** (if needed) — extend the enum in `src/errors/`.
-6. **Add business logic** — implement in `src/logic/`.
-7. **Log** at appropriate levels: `debug!` for request/response, `warn!` for bad input, `error!` for failures.
+| Method | Description |
+|---|---|
+| `DBWrapper::new(path)` | Open/create database files |
+| `db.init_tables(\|db\| { ... })` | Register tables via closure |
+| `db.register_table(def)` | Register a regular table |
+| `db.register_ttl_table(def, ttl)` | Register a TTL table |
+| `db.next(id) -> u64` | Atomic counter increment (~8 ns) |
+| `db.write(def, key, value)` | Buffer a write |
+| `db.write_ttl(def, key, value, ttl)` | Buffer a TTL write |
+| `db.get_buffered(table, key_bytes) -> Option<Vec<u8>>` | Look up in buffers |
+| `db.flush_counters()` | Persist dirty counters |
+| `db.flush_buffers()` | Persist all buffered writes |
+| `db.compact()` | Run redb compaction |
+| `db.backup()` | Create timestamped backup |
+| `db.pending_writes() -> usize` | Buffered entries count |
 
 ---
 
@@ -157,12 +137,11 @@ AppError (umbrella)
 
 | Area | Convention |
 |------|-----------|
-| Naming | `snake_case` for modules/files, `CamelCase` for types |
-| Imports | `use crate::module::Type` — no `super::` |
+| Naming | `snake_case` modules/files, `CamelCase` types |
 | Errors | `thiserror` derive, `#[from]` for auto-conversion |
-| Logging | Always include table/endpoint name in log messages |
-| Async | `ntex::web` handlers are `async fn` returning `impl Responder` |
-| State | Pass via `ntex::web::types::State<T>` |
+| Logging | `log` crate — `debug!` for flush counts, `error!` for failures |
+| Visibility | `pub` for public API, `pub(crate)` for internals |
+| Unsafe | `as_self_type_ref` for redb Value serialisation only |
 
 ---
 
@@ -170,11 +149,7 @@ AppError (umbrella)
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `ntex` | 3.9 | Web framework (compio runtime) |
-| `shodh-redb` | 0.5 | Embedded K/V database with TTL |
-| `flatbuffers` | 25.12 | Zero-copy serialisation |
+| `shodh-redb` | 0.5 | Embedded K/V database (TTL fork) |
 | `log` | 0.4 | Lightweight logging facade |
 | `thiserror` | 2.0 | Derive `Error` for enums |
-| `blake3` | 1 | Build-time hash caching |
-| `serde` / `serde_json` | 1 | Build-script config |
-| `reqwest` | 0.12 | Dev — manual HTTP test client (blocking) |
+| `criterion` | 0.5 | Dev — benchmarks |

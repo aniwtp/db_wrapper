@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shodh_redb::ttl_table::TtlTableDefinition;
-use shodh_redb::{Database, Key, TableDefinition, TableHandle, Value};
+use shodh_redb::{Database, Key, ReadableDatabase, TableDefinition, TableHandle, Value};
 
 use crate::buffer::{BufferStore, serialize_value};
 use crate::counter::{
@@ -222,10 +222,52 @@ impl DBWrapper {
     /// Look up a key in the write buffers (regular → TTL).
     /// Returns `None` if not found in either buffer — caller should
     /// fall back to a direct DB read via `self.db`.
+    ///
+    /// Prefer [`get`](Self::get) for a single-call buffer+DB lookup.
     pub fn get_buffered(&self, table_name: &str, key_bytes: &[u8]) -> Option<Vec<u8>> {
         self.regular_buf
             .get(table_name, key_bytes)
             .or_else(|| self.ttl_buf.get(table_name, key_bytes))
+    }
+
+    /// Buffer-first read with automatic DB fallback.
+    ///
+    /// Checks the write buffers first, then falls back to a direct redb read.
+    /// Returns the raw value bytes (as stored in the buffer).
+    /// This is the recommended single-call lookup for most use cases.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(bytes) = db.get(MY_TABLE, my_key)? {
+    ///     let item: MyType = postcard::from_bytes(&bytes)?;
+    /// }
+    /// ```
+    pub fn get<K, V>(
+        &self,
+        def: TableDefinition<'static, K, V>,
+        key: K,
+    ) -> Result<Option<Vec<u8>>, DbError>
+    where
+        K: Key + Send + 'static,
+        V: Value + Send + 'static,
+    {
+        let key_bytes = serialize_value(&key);
+
+        // 1. Buffer-first — catches unflushed writes.
+        if let Some(v_bytes) = self.get_buffered(def.name(), &key_bytes) {
+            return Ok(Some(v_bytes));
+        }
+
+        // 2. DB fallback — use from_bytes to get SelfType (avoids Borrow<SelfType> HRTB).
+        let tx = db!(self.db.begin_read())?;
+        let table = db!(tx.open_table(def))?;
+        let k_ref = K::from_bytes(&key_bytes);
+        if let Some(guard) = db!(table.get(k_ref))? {
+            let v_bytes = V::as_bytes(&guard.value()).as_ref().to_vec();
+            return Ok(Some(v_bytes));
+        }
+        Ok(None)
     }
 
     // -- Flush ---------------------------------------------------------------
@@ -253,7 +295,7 @@ impl DBWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shodh_redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    use shodh_redb::{ReadableDatabase, TableDefinition};
     use std::fs;
     use std::sync::atomic::AtomicU32;
 
@@ -328,6 +370,43 @@ mod tests {
     fn get_buffered_nonexistent() {
         let (db, _dir) = open_db();
         assert!(db.get_buffered(TEST_TABLE.name(), b"no_such_key").is_none());
+    }
+
+    #[test]
+    fn get_from_buffer_before_flush() {
+        let (db, _dir) = open_db();
+        db.write(TEST_TABLE, 1u64, "hello".to_string()).expect("write");
+
+        let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
+        assert_eq!(String::from_bytes(&val), "hello");
+    }
+
+    #[test]
+    fn get_db_fallback_after_flush() {
+        let (db, _dir) = open_db();
+        db.write(TEST_TABLE, 1u64, "persisted".to_string()).expect("write");
+        db.flush_buffers().expect("flush");
+        assert_eq!(db.pending_writes(), 0);
+
+        // Buffer is empty — should fall back to DB.
+        let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
+        assert_eq!(String::from_bytes(&val), "persisted");
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let (db, _dir) = open_db();
+        assert!(db.get(TEST_TABLE, 999u64).expect("get").is_none());
+    }
+
+    #[test]
+    fn get_overwrite_in_buffer() {
+        let (db, _dir) = open_db();
+        db.write(TEST_TABLE, 1u64, "old".to_string()).expect("w1");
+        db.write(TEST_TABLE, 1u64, "new".to_string()).expect("w2");
+
+        let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
+        assert_eq!(String::from_bytes(&val), "new");
     }
 
     #[test]

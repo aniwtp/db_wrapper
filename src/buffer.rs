@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn auto_flush_on_max_size() {
-        let (db, store, _dir) = setup();
+        let (db, _store, _dir) = setup();
         // Override max_size.
         let store = BufferStore::new(3);
         store.register_regular(TEST_TABLE);

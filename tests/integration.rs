@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use shodh_redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle, Value};
+use shodh_redb::{ReadableDatabase, TableDefinition, TableHandle, Value};
 use db_wrapper::DBWrapper;
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);

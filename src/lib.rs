@@ -15,6 +15,7 @@ pub mod error;
 pub use wrapper::DBWrapper;
 pub use error::DbError;
 pub use buffer::serialize_value;
+pub use buffer::strip_varint;
 
 // ---------------------------------------------------------------------------
 // Internal helper macro — wraps redb calls into DbError::Redb

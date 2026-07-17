@@ -91,6 +91,39 @@ pub fn serialize_value<T: Value>(value: &T) -> Vec<u8> {
     T::as_bytes(unsafe { as_self_type_ref(value) }).as_ref().to_vec()
 }
 
+/// Strip a single varint length prefix from the beginning of a byte slice.
+///
+/// Redb's [`Value`] impl for `Vec<T>` prepends a varint-encoded element count.
+/// Use this to recover the raw inner bytes when storing blob data as `Vec<u8>`.
+///
+/// Returns the bytes after the varint prefix.  Returns the original slice
+/// unchanged if the data is too short to contain a valid varint.
+///
+/// # Example
+///
+/// ```ignore
+/// // TableDefinition<u64, Vec<u8>> stores with a varint prefix.
+/// let raw = db.get(MY_TABLE, key)?.map(|b| strip_varint(&b));
+/// let item: MyType = postcard::from_bytes(raw.unwrap())?;
+/// ```
+pub fn strip_varint(data: &[u8]) -> &[u8] {
+    if data.is_empty() {
+        return data;
+    }
+    let consumed = match data[0] {
+        0..=253 => 1,
+        254 => {
+            if data.len() < 3 { return data; }
+            3
+        }
+        255 => {
+            if data.len() < 5 { return data; }
+            5
+        }
+    };
+    &data[consumed..]
+}
+
 // ---------------------------------------------------------------------------
 // BufferStore — one buffer for regular, one for TTL
 // ---------------------------------------------------------------------------

@@ -270,6 +270,41 @@ impl DBWrapper {
         Ok(None)
     }
 
+    // -- Remove ---------------------------------------------------------------
+
+    /// Remove a key from both buffers and the database.
+    ///
+    /// This is the recommended single-call deletion for most use cases.
+    /// It ensures the key is gone from both the in-memory buffer and the
+    /// on-disk redb store.
+    pub fn remove<K, V>(
+        &self,
+        def: TableDefinition<'static, K, V>,
+        key: K,
+    ) -> Result<(), DbError>
+    where
+        K: Key + Send + 'static,
+        V: Value + Send + 'static,
+    {
+        let key_bytes = serialize_value(&key);
+
+        // 1. Remove from both buffers (regular + TTL).
+        let _ = self.regular_buf.remove(def.name(), &key_bytes);
+        let _ = self.ttl_buf.remove(def.name(), &key_bytes);
+
+        // 2. Remove from DB.
+        let tx = db!(self.db.begin_write())?;
+        {
+            let mut table = db!(tx.open_table(def))?;
+            let k_ref = K::from_bytes(&key_bytes);
+            db!(table.remove(k_ref))?;
+        }
+        db!(tx.commit())?;
+
+        log::trace!("remove `{}`", def.name());
+        Ok(())
+    }
+
     // -- Flush ---------------------------------------------------------------
 
     /// Flush both regular and TTL buffers to disk.
@@ -407,6 +442,38 @@ mod tests {
 
         let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
         assert_eq!(String::from_bytes(&val), "new");
+    }
+
+    #[test]
+    fn remove_from_buffer() {
+        let (db, _dir) = open_db();
+        db.write(TEST_TABLE, 1u64, "x".to_string()).expect("write");
+        assert!(db.get(TEST_TABLE, 1u64).expect("get").is_some());
+
+        db.remove(TEST_TABLE, 1u64).expect("remove");
+        assert!(db.get(TEST_TABLE, 1u64).expect("get").is_none());
+        assert!(db.get_buffered(TEST_TABLE.name(), &serialize_value(&1u64)).is_none());
+    }
+
+    #[test]
+    fn remove_from_db_after_flush() {
+        let (db, _dir) = open_db();
+        db.write(TEST_TABLE, 1u64, "x".to_string()).expect("write");
+        db.write(TEST_TABLE, 2u64, "y".to_string()).expect("write");
+        db.flush_buffers().expect("flush");
+        assert_eq!(db.pending_writes(), 0);
+
+        // Remove from flushed DB.
+        db.remove(TEST_TABLE, 1u64).expect("remove");
+        assert!(db.get(TEST_TABLE, 1u64).expect("get").is_none());
+        assert!(db.get(TEST_TABLE, 2u64).expect("get").is_some()); // other key survives
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let (db, _dir) = open_db();
+        // Removing a key that doesn't exist should not error.
+        db.remove(TEST_TABLE, 999u64).expect("remove");
     }
 
     #[test]

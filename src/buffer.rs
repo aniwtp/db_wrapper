@@ -223,6 +223,23 @@ impl BufferStore {
             .map(|e| e.value_bytes.clone())
     }
 
+    /// Remove an entry from the buffer by table name and key bytes.
+    /// Returns `true` if an entry was removed.
+    pub(crate) fn remove(&self, table_name: &str, key_bytes: &[u8]) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(pos) = entries
+            .iter()
+            .rev()
+            .position(|e| e.table_name == table_name && e.key_bytes == key_bytes)
+        {
+            let idx = entries.len() - 1 - pos;
+            entries.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Number of pending entries.
     pub(crate) fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
@@ -367,5 +384,22 @@ mod tests {
 
         let found = store.get(TEST_TABLE.name(), &k).unwrap();
         assert_eq!(String::from_bytes(&found), "new");
+    }
+
+    #[test]
+    fn remove_from_buffer() {
+        let (db, store, _dir) = setup();
+        let k = serialize_value(&1u64);
+        store.push(TEST_TABLE.name(), k.clone(), serialize_value(&"x".to_string()), &db, false).unwrap();
+        assert!(store.get(TEST_TABLE.name(), &k).is_some());
+
+        assert!(store.remove(TEST_TABLE.name(), &k));
+        assert!(store.get(TEST_TABLE.name(), &k).is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false() {
+        let (_db, store, _dir) = setup();
+        assert!(!store.remove("no_table", b"no_key"));
     }
 }

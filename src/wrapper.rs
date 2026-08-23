@@ -6,11 +6,9 @@ use std::time::Duration;
 use shodh_redb::ttl_table::TtlTableDefinition;
 use shodh_redb::{Database, Key, ReadableDatabase, TableDefinition, TableHandle, Value};
 
-use crate::buffer::{BufferStore, serialize_value};
-use crate::counter::{
-    CounterStore, COUNTER_BLOB, BUFFER_FLUSH_SECS, BUFFER_MAX_ENTRIES,
-};
 use crate::DbError;
+use crate::buffer::{BufferStore, serialize_value};
+use crate::counter::{BUFFER_FLUSH_SECS, BUFFER_MAX_ENTRIES, COUNTER_BLOB, CounterStore};
 use crate::db;
 
 // ---------------------------------------------------------------------------
@@ -75,7 +73,9 @@ impl DBWrapper {
         // Both buffers flush counters first (for approximate sync).
         let on_flush: Arc<dyn Fn() + Send + Sync> = {
             let c = counters.clone();
-            Arc::new(move || { let _ = c.flush(); })
+            Arc::new(move || {
+                let _ = c.flush();
+            })
         };
         let regular_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES));
         regular_buf.set_on_flush(on_flush.clone());
@@ -83,7 +83,12 @@ impl DBWrapper {
         ttl_buf.set_on_flush(on_flush);
 
         log::info!("database opened: {path} (+ {counter_path})");
-        Ok(Self { db, regular_buf, ttl_buf, counters })
+        Ok(Self {
+            db,
+            regular_buf,
+            ttl_buf,
+            counters,
+        })
     }
 
     /// Register tables via a closure.  Call once at startup.
@@ -113,8 +118,9 @@ impl DBWrapper {
 
     /// Increment an atomic counter and return the new value.
     ///
-    /// In-memory operation — counters are flushed to redb periodically
-    /// by the maintenance loop (every 5 min by default).
+    /// In-memory operation — counters are flushed to redb on explicit
+    /// `flush_counters`, before any buffer flush, and by `write_ttl`
+    /// with a TTL shorter than `BUFFER_FLUSH_SECS`.
     pub fn next(&self, counter_id: u8) -> u64 {
         self.counters.next(counter_id)
     }
@@ -156,27 +162,51 @@ impl DBWrapper {
         K: Key + Send + Sync + 'static,
         V: Value + Send + Sync + 'static,
     {
-        // Ensure table exists.
-        if let Ok(tx) = self.db.begin_write() {
-            let _ = tx.open_table(def);
-            let _ = tx.commit();
+        // Ensure table exists.  Failure to open a transaction is non-fatal
+        // here: `open_table` inside a write transaction also creates the
+        // table, so a later flush will create it even if this call failed.
+        let tx = match self.db.begin_write() {
+            Ok(tx) => tx,
+            Err(e) => {
+                log::error!("register_table `{}`: begin_write failed: {e}", def.name());
+                self.regular_buf.register_regular(def);
+                return;
+            }
+        };
+        {
+            let table = tx.open_table(def);
+            drop(table);
+            if let Err(e) = tx.commit() {
+                log::error!("register_table `{}`: commit failed: {e}", def.name());
+            }
         }
         self.regular_buf.register_regular(def);
         log::debug!("registered regular table `{}`", def.name());
     }
 
     /// Register a TTL table so the buffer knows how to flush it.
-    pub fn register_ttl_table<K, V>(
-        &self,
-        def: TtlTableDefinition<K, V>,
-        default_ttl: Duration,
-    ) where
+    pub fn register_ttl_table<K, V>(&self, def: TtlTableDefinition<K, V>, default_ttl: Duration)
+    where
         K: Key + Send + Sync + 'static,
         V: Value + Send + Sync + 'static,
     {
-        if let Ok(tx) = self.db.begin_write() {
-            let _ = tx.open_ttl_table(def);
-            let _ = tx.commit();
+        let tx = match self.db.begin_write() {
+            Ok(tx) => tx,
+            Err(e) => {
+                log::error!(
+                    "register_ttl_table `{}`: begin_write failed: {e}",
+                    def.name()
+                );
+                self.ttl_buf.register_ttl(def, default_ttl);
+                return;
+            }
+        };
+        {
+            let table = tx.open_ttl_table(def);
+            drop(table);
+            if let Err(e) = tx.commit() {
+                log::error!("register_ttl_table `{}`: commit failed: {e}", def.name());
+            }
         }
         self.ttl_buf.register_ttl(def, default_ttl);
         log::debug!("registered TTL table `{}`", def.name());
@@ -195,7 +225,8 @@ impl DBWrapper {
     {
         let k_bytes = serialize_value(&key);
         let v_bytes = serialize_value(&value);
-        self.regular_buf.push(def.name(), k_bytes, v_bytes, &self.db, false)
+        self.regular_buf
+            .push(def.name(), k_bytes, v_bytes, &self.db, false)
     }
 
     /// Write a key-value pair to the TTL buffer.
@@ -214,7 +245,8 @@ impl DBWrapper {
         let force = ttl < Duration::from_secs(BUFFER_FLUSH_SECS);
         let k_bytes = serialize_value(&key);
         let v_bytes = serialize_value(&value);
-        self.ttl_buf.push(def.name(), k_bytes, v_bytes, &self.db, force)
+        self.ttl_buf
+            .push(def.name(), k_bytes, v_bytes, &self.db, force)
     }
 
     // -- Read (buffer-first) -------------------------------------------------
@@ -277,11 +309,7 @@ impl DBWrapper {
     /// This is the recommended single-call deletion for most use cases.
     /// It ensures the key is gone from both the in-memory buffer and the
     /// on-disk redb store.
-    pub fn remove<K, V>(
-        &self,
-        def: TableDefinition<'static, K, V>,
-        key: K,
-    ) -> Result<(), DbError>
+    pub fn remove<K, V>(&self, def: TableDefinition<'static, K, V>, key: K) -> Result<(), DbError>
     where
         K: Key + Send + 'static,
         V: Value + Send + 'static,
@@ -373,7 +401,8 @@ mod tests {
     #[test]
     fn write_and_get_from_buffer() {
         let (db, _dir) = open_db();
-        db.write(TEST_TABLE, 1u64, "hello".to_string()).expect("write");
+        db.write(TEST_TABLE, 1u64, "hello".to_string())
+            .expect("write");
 
         // Should be readable immediately from buffer (before flush).
         let k = serialize_value(&1u64);
@@ -410,7 +439,8 @@ mod tests {
     #[test]
     fn get_from_buffer_before_flush() {
         let (db, _dir) = open_db();
-        db.write(TEST_TABLE, 1u64, "hello".to_string()).expect("write");
+        db.write(TEST_TABLE, 1u64, "hello".to_string())
+            .expect("write");
 
         let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
         assert_eq!(String::from_bytes(&val), "hello");
@@ -419,7 +449,8 @@ mod tests {
     #[test]
     fn get_db_fallback_after_flush() {
         let (db, _dir) = open_db();
-        db.write(TEST_TABLE, 1u64, "persisted".to_string()).expect("write");
+        db.write(TEST_TABLE, 1u64, "persisted".to_string())
+            .expect("write");
         db.flush_buffers().expect("flush");
         assert_eq!(db.pending_writes(), 0);
 
@@ -452,7 +483,10 @@ mod tests {
 
         db.remove(TEST_TABLE, 1u64).expect("remove");
         assert!(db.get(TEST_TABLE, 1u64).expect("get").is_none());
-        assert!(db.get_buffered(TEST_TABLE.name(), &serialize_value(&1u64)).is_none());
+        assert!(
+            db.get_buffered(TEST_TABLE.name(), &serialize_value(&1u64))
+                .is_none()
+        );
     }
 
     #[test]
@@ -495,10 +529,14 @@ mod tests {
         let b2 = db.clone();
 
         let h1 = std::thread::spawn(move || {
-            for _ in 0..5000 { b1.next(0); }
+            for _ in 0..5000 {
+                b1.next(0);
+            }
         });
         let h2 = std::thread::spawn(move || {
-            for _ in 0..5000 { b2.next(0); }
+            for _ in 0..5000 {
+                b2.next(0);
+            }
         });
         h1.join().unwrap();
         h2.join().unwrap();
@@ -510,7 +548,9 @@ mod tests {
     #[test]
     fn flush_counters_persists() {
         let (db, _dir) = open_db();
-        for _ in 0..100 { db.next(0); }
+        for _ in 0..100 {
+            db.next(0);
+        }
         db.flush_counters().expect("flush");
         // After flush + reload: value should survive.
         let val = db.next(0);
@@ -518,12 +558,194 @@ mod tests {
     }
 
     #[test]
+    fn write_ttl_short_ttl_flushes_immediately() {
+        use shodh_redb::ttl_table::TtlTableDefinition;
+        const TTL_TABLE: TtlTableDefinition<u64, String> =
+            TtlTableDefinition::new("test_ttl_short");
+
+        let dir = unique_dir("wrapper_ttl_short");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::new(data_path.to_str().unwrap()).expect("new");
+        db.register_ttl_table(TTL_TABLE, Duration::from_secs(3600));
+
+        // ttl < BUFFER_FLUSH_SECS → force flush, entry lands in DB at once.
+        db.write_ttl(
+            TTL_TABLE,
+            1u64,
+            "expiring".to_string(),
+            Duration::from_secs(1),
+        )
+        .expect("write_ttl");
+
+        let tx = db.db.begin_read().expect("read");
+        let table = tx.open_ttl_table(TTL_TABLE).expect("open");
+        let guard = table.get(1u64).expect("get").expect("present");
+        assert_eq!(guard.value(), "expiring");
+        assert!(guard.expires_at_ms() > 0);
+    }
+
+    #[test]
+    fn write_ttl_long_ttl_stays_buffered_until_flush() {
+        use shodh_redb::ttl_table::TtlTableDefinition;
+        const TTL_TABLE: TtlTableDefinition<u64, String> = TtlTableDefinition::new("test_ttl_long");
+
+        let dir = unique_dir("wrapper_ttl_long");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::new(data_path.to_str().unwrap()).expect("new");
+        db.register_ttl_table(TTL_TABLE, Duration::from_secs(3600));
+
+        // ttl >= BUFFER_FLUSH_SECS → buffered, not yet in DB.
+        db.write_ttl(
+            TTL_TABLE,
+            1u64,
+            "buffered".to_string(),
+            Duration::from_secs(60),
+        )
+        .expect("write_ttl");
+
+        let key_bytes = serialize_value(&1u64);
+        let in_buf = db
+            .get_buffered(TTL_TABLE.name(), &key_bytes)
+            .expect("in ttl buffer");
+        assert_eq!(String::from_bytes(&in_buf), "buffered");
+
+        let tx = db.db.begin_read().expect("read");
+        let table = tx.open_ttl_table(TTL_TABLE).expect("open");
+        assert!(table.get(1u64).unwrap().is_none());
+
+        db.flush_buffers().expect("flush");
+        let tx = db.db.begin_read().expect("read");
+        let table = tx.open_ttl_table(TTL_TABLE).expect("open");
+        assert_eq!(table.get(1u64).unwrap().unwrap().value(), "buffered");
+    }
+
+    #[test]
+    fn get_buffered_reads_ttl_buffer() {
+        use shodh_redb::ttl_table::TtlTableDefinition;
+        const TTL_TABLE: TtlTableDefinition<u64, String> = TtlTableDefinition::new("test_ttl_gb");
+
+        let dir = unique_dir("wrapper_ttl_gb");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::new(data_path.to_str().unwrap()).expect("new");
+        db.register_ttl_table(TTL_TABLE, Duration::from_secs(3600));
+
+        db.write_ttl(
+            TTL_TABLE,
+            7u64,
+            "ttl_value".to_string(),
+            Duration::from_secs(60),
+        )
+        .expect("write_ttl");
+
+        let val = db
+            .get_buffered(TTL_TABLE.name(), &serialize_value(&7u64))
+            .expect("value");
+        assert_eq!(String::from_bytes(&val), "ttl_value");
+    }
+
+    #[test]
+    fn register_table_is_idempotent() {
+        let (db, _dir) = open_db();
+        db.register_table(TEST_TABLE);
+        db.register_table(TEST_TABLE);
+        db.write(TEST_TABLE, 1u64, "x".to_string()).expect("write");
+        db.flush_buffers().expect("flush");
+        assert!(db.get(TEST_TABLE, 1u64).expect("get").is_some());
+    }
+
+    #[test]
+    fn remove_does_not_resurrect_after_flush() {
+        let (db, _dir) = open_db();
+        // Two writes to the same key, then remove: nothing must come back.
+        db.write(TEST_TABLE, 1u64, "old".to_string()).expect("w1");
+        db.write(TEST_TABLE, 1u64, "new".to_string()).expect("w2");
+        db.remove(TEST_TABLE, 1u64).expect("remove");
+
+        db.flush_buffers().expect("flush");
+        assert!(db.get(TEST_TABLE, 1u64).expect("get").is_none());
+
+        // And the DB itself must not contain the key.
+        let tx = db.db.begin_read().expect("read");
+        let table = tx.open_table(TEST_TABLE).expect("open");
+        assert!(table.get(1u64).unwrap().is_none());
+    }
+
+    #[test]
+    fn roundtrip_supported_value_types() {
+        use crate::strip_varint;
+        const STR_TABLE: TableDefinition<u64, String> = TableDefinition::new("rt_str");
+        const BLOB_TABLE: TableDefinition<u64, Vec<u8>> = TableDefinition::new("rt_blob");
+        const LIST_TABLE: TableDefinition<u64, Vec<String>> = TableDefinition::new("rt_list");
+
+        let dir = unique_dir("wrapper_rt");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::new(data_path.to_str().unwrap()).expect("new");
+        db.register_table(STR_TABLE);
+        db.register_table(BLOB_TABLE);
+        db.register_table(LIST_TABLE);
+
+        db.write(STR_TABLE, 1u64, "text".to_string()).expect("w1");
+        db.write(BLOB_TABLE, 1u64, vec![1u8, 2, 3, 250])
+            .expect("w2");
+        db.write(LIST_TABLE, 1u64, vec!["a".to_string(), "b".to_string()])
+            .expect("w3");
+        db.flush_buffers().expect("flush");
+
+        let tx = db.db.begin_read().expect("read");
+        assert_eq!(
+            tx.open_table(STR_TABLE)
+                .unwrap()
+                .get(1u64)
+                .unwrap()
+                .unwrap()
+                .value(),
+            "text"
+        );
+        assert_eq!(
+            tx.open_table(BLOB_TABLE)
+                .unwrap()
+                .get(1u64)
+                .unwrap()
+                .unwrap()
+                .value(),
+            vec![1u8, 2, 3, 250]
+        );
+        assert_eq!(
+            tx.open_table(LIST_TABLE)
+                .unwrap()
+                .get(1u64)
+                .unwrap()
+                .unwrap()
+                .value(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+
+        // Vec<u8> roundtrip through the wrapper's get() — varint prefix check.
+        let raw = db.get(BLOB_TABLE, 1u64).expect("get").expect("value");
+        assert_eq!(strip_varint(&raw), &[1u8, 2, 3, 250]);
+    }
+
+    #[test]
     fn backup_creates_file() {
         let (db, _dir) = open_db();
         db.backup().expect("backup");
-        let backups: Vec<_> = fs::read_dir("backups").unwrap()
+        let backups: Vec<_> = fs::read_dir("backups")
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().map(|n| n.starts_with("redb_")).unwrap_or(false))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("redb_"))
+                    .unwrap_or(false)
+            })
             .collect();
         assert!(!backups.is_empty());
     }

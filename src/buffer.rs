@@ -4,15 +4,15 @@
 //! - **regular** — normal inserts, flushed together.
 //! - **ttl**    — TTL inserts, force-flushed if expiry is sooner than next flush.
 //!
-//! A single maintenance loop (in `wrapper.rs`) handles all flushing —
-//! no per-table background tasks.
+//! Flushing is triggered manually, by the size threshold, or by a short TTL —
+//! there is no background maintenance loop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use shodh_redb::ttl_table::TtlTableDefinition;
-use shodh_redb::{Database, Key,  TableDefinition, TableHandle, Value};
+use shodh_redb::{Database, Key, TableDefinition, TableHandle, Value};
 
 use crate::DbError;
 use crate::db;
@@ -24,12 +24,7 @@ use crate::db;
 /// Knows how to flush a batch of raw (key_bytes, value_bytes) pairs
 /// into a specific redb table.  One instance per registered table.
 trait FlushTarget: Send + Sync {
-    // fn name(&self) -> &str;
-    fn flush(
-        &self,
-        db: &Database,
-        entries: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<(), DbError>;
+    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError>;
 }
 
 /// Concrete impl for a regular table.
@@ -37,9 +32,10 @@ struct RegularTarget<K: Key + 'static + Send + Sync, V: Value + 'static + Send +
     def: TableDefinition<'static, K, V>,
 }
 
-impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget for RegularTarget<K, V> {
-    // fn name(&self) -> &str { self.def.name() }
-    fn flush(&self, db: &Database, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
+impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget
+    for RegularTarget<K, V>
+{
+    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError> {
         let tx = db!(db.begin_write())?;
         {
             let mut table = db!(tx.open_table(self.def))?;
@@ -60,9 +56,10 @@ struct TtlTarget<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Syn
     default_ttl: Duration,
 }
 
-impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget for TtlTarget<K, V> {
-    // fn name(&self) -> &str { self.def.name() }
-    fn flush(&self, db: &Database, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
+impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget
+    for TtlTarget<K, V>
+{
+    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError> {
         let tx = db!(db.begin_write())?;
         {
             let mut table = db!(tx.open_ttl_table(self.def))?;
@@ -82,13 +79,24 @@ impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarg
 // ---------------------------------------------------------------------------
 
 /// Reinterprets a `&T` as `&T::SelfType<'_>`.
+///
+/// # Safety
+///
+/// `shodh_redb::Value::SelfType<'a>` is, by the crate's design, the same type
+/// as `Self` with owned fields kept owned (e.g. `String` → `String`,
+/// `Vec<T>` → `Vec<T::SelfType>`, tuples → tuples of `SelfType`s).  All
+/// these have the same layout as the source type, so the pointer cast is
+/// sound.  `K::from_bytes`/`V::from_bytes` are used on the flush side to
+/// recover `SelfType` from the raw bytes.
 unsafe fn as_self_type_ref<T: Value>(value: &T) -> &T::SelfType<'_> {
     unsafe { &*(value as *const T as *const T::SelfType<'_>) }
 }
 
 /// Serialise a `Value` to bytes.
 pub fn serialize_value<T: Value>(value: &T) -> Vec<u8> {
-    T::as_bytes(unsafe { as_self_type_ref(value) }).as_ref().to_vec()
+    T::as_bytes(unsafe { as_self_type_ref(value) })
+        .as_ref()
+        .to_vec()
 }
 
 /// Strip a single varint length prefix from the beginning of a byte slice.
@@ -113,11 +121,15 @@ pub fn strip_varint(data: &[u8]) -> &[u8] {
     let consumed = match data[0] {
         0..=253 => 1,
         254 => {
-            if data.len() < 3 { return data; }
+            if data.len() < 3 {
+                return data;
+            }
             3
         }
         255 => {
-            if data.len() < 5 { return data; }
+            if data.len() < 5 {
+                return data;
+            }
             5
         }
     };
@@ -128,12 +140,20 @@ pub fn strip_varint(data: &[u8]) -> &[u8] {
 // BufferStore — one buffer for regular, one for TTL
 // ---------------------------------------------------------------------------
 
+/// Pending (key bytes → value bytes) pairs for a single table.
+type TableEntries = HashMap<Vec<u8>, Vec<u8>>;
+
 /// A single buffer holding pending writes across all tables of one kind
-/// (regular or TTL).  Flushed by the maintenance loop.
+/// (regular or TTL).  Flushed manually, by size threshold, or on short TTL.
+///
+/// Pending entries are stored as `table → (key → value)`.  Only the most
+/// recent value per key is kept: repeated writes to the same key overwrite
+/// the previous entry in place, so lookups are O(1) and removing a key
+/// drops every occurrence of it.
 pub(crate) struct BufferStore {
-    /// Pending entries: (table_name, key_bytes, value_bytes).
-    entries: Mutex<Vec<BufferEntry>>,
-    /// How to flush each table.  Populated lazily on first write.
+    /// Pending entries per table: table name → (key bytes → value bytes).
+    entries: Mutex<HashMap<String, TableEntries>>,
+    /// How to flush each table.  Populated by `register_*`.
     targets: Mutex<HashMap<String, Arc<dyn FlushTarget>>>,
     /// Max pending entries before auto-flush (0 = no limit).
     max_size: usize,
@@ -142,16 +162,10 @@ pub(crate) struct BufferStore {
     on_flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-struct BufferEntry {
-    table_name: String,
-    key_bytes: Vec<u8>,
-    value_bytes: Vec<u8>,
-}
-
 impl BufferStore {
     pub(crate) fn new(max_size: usize) -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             max_size,
             on_flush: Mutex::new(None),
@@ -164,7 +178,10 @@ impl BufferStore {
     }
 
     /// Register a regular table for flushing.
-    pub(crate) fn register_regular<K: Key + Send + Sync + 'static, V: Value + Send + Sync + 'static>(
+    pub(crate) fn register_regular<
+        K: Key + Send + Sync + 'static,
+        V: Value + Send + Sync + 'static,
+    >(
         &self,
         def: TableDefinition<'static, K, V>,
     ) {
@@ -194,12 +211,14 @@ impl BufferStore {
         force_flush: bool,
     ) -> Result<(), DbError> {
         let mut entries = self.entries.lock().unwrap();
-        entries.push(BufferEntry {
-            table_name: table_name.to_owned(),
-            key_bytes,
-            value_bytes,
-        });
-        let len = entries.len();
+        // Look up the table by `&str` first: no `String` allocation on the
+        // hot path; a table name is only allocated the first time it appears.
+        let map = match entries.get_mut(table_name) {
+            Some(m) => m,
+            None => entries.entry(table_name.to_owned()).or_default(),
+        };
+        map.insert(key_bytes, value_bytes);
+        let len: usize = entries.values().map(HashMap::len).sum();
         let should_flush = force_flush || (self.max_size > 0 && len >= self.max_size);
         drop(entries);
 
@@ -215,72 +234,98 @@ impl BufferStore {
     /// Look up the most recent value for a key in the buffer.
     /// Returns `None` if not found (caller should fall back to DB).
     pub(crate) fn get(&self, table_name: &str, key_bytes: &[u8]) -> Option<Vec<u8>> {
-        let entries = self.entries.lock().unwrap();
-        entries
-            .iter()
-            .rev() // newest first
-            .find(|e| e.table_name == table_name && e.key_bytes == key_bytes)
-            .map(|e| e.value_bytes.clone())
+        self.entries
+            .lock()
+            .unwrap()
+            .get(table_name)
+            .and_then(|m| m.get(key_bytes))
+            .cloned()
     }
 
-    /// Remove an entry from the buffer by table name and key bytes.
-    /// Returns `true` if an entry was removed.
+    /// Remove a key from the buffer.  Drops every pending occurrence of the
+    /// key (repeated writes collapse into one entry).  Returns `true` if an
+    /// entry was removed.
     pub(crate) fn remove(&self, table_name: &str, key_bytes: &[u8]) -> bool {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(pos) = entries
-            .iter()
-            .rev()
-            .position(|e| e.table_name == table_name && e.key_bytes == key_bytes)
-        {
-            let idx = entries.len() - 1 - pos;
-            entries.remove(idx);
-            true
-        } else {
-            false
+        if let Some(map) = entries.get_mut(table_name) {
+            let existed = map.remove(key_bytes).is_some();
+            if map.is_empty() {
+                entries.remove(table_name);
+            }
+            return existed;
         }
+        false
     }
 
-    /// Number of pending entries.
+    /// Number of pending entries (unique keys across all tables).
     pub(crate) fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .map(HashMap::len)
+            .sum()
     }
 
     /// Flush all pending entries to redb, grouped by table.
     /// Calls `on_flush` callback first (if set) to sync related state.
+    ///
+    /// If flushing fails part-way, all pending entries are put back into the
+    /// buffer so no data is lost (entries that were already written are
+    /// re-inserted idempotently on the next attempt).
     pub(crate) fn flush(&self, db: &Database) -> Result<usize, DbError> {
         // Sync related state (e.g., counters) before writing buffered data.
-        if let Some(cb) = self.on_flush.lock().unwrap().as_ref() {
+        // Clone the Arc so the mutex is not held during the callback.
+        let on_flush = self.on_flush.lock().unwrap().clone();
+        if let Some(cb) = on_flush {
             cb();
         }
+
         let mut entries = self.entries.lock().unwrap();
         if entries.is_empty() {
             return Ok(0);
         }
-        let batch: Vec<BufferEntry> = std::mem::take(&mut *entries);
+        let batch = std::mem::take(&mut *entries);
         drop(entries);
 
-        let count = batch.len();
-
-        // Group by table name.
-        let mut by_table: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
-        for e in batch {
-            by_table
-                .entry(e.table_name)
-                .or_default()
-                .push((e.key_bytes, e.value_bytes));
-        }
+        let count: usize = batch.values().map(HashMap::len).sum();
 
         // Flush each table via its registered target.
         let targets = self.targets.lock().unwrap();
-        for (name, pairs) in &by_table {
-            let target = targets.get(name).ok_or_else(|| {
-                log::error!("BufferStore::flush: no target registered for table `{name}`");
-                DbError::TableNotFound(name.clone())
-            })?;
-            target.flush(db, pairs)?;
+        let mut failure = None;
+        for (name, pairs) in &batch {
+            let target = match targets.get(name) {
+                Some(t) => t,
+                None => {
+                    log::error!("BufferStore::flush: no target registered for table `{name}`");
+                    failure = Some(DbError::TableNotFound(name.clone()));
+                    break;
+                }
+            };
+            if let Err(e) = target.flush(db, pairs) {
+                failure = Some(e);
+                break;
+            }
+        }
+        drop(targets);
+
+        if let Some(e) = failure {
+            // Put everything back; entries pushed concurrently after the
+            // `take` take precedence over the returned batch.
+            let mut entries = self.entries.lock().unwrap();
+            for (name, pairs) in batch {
+                let map = entries.entry(name).or_default();
+                for (k, v) in pairs {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            return Err(e);
         }
 
-        log::debug!("BufferStore::flush: {count} entries across {} tables", by_table.len());
+        log::debug!(
+            "BufferStore::flush: {count} entries across {} tables",
+            batch.len()
+        );
         Ok(count)
     }
 }
@@ -294,7 +339,7 @@ mod tests {
     use super::*;
     use shodh_redb::ReadableDatabase;
     use std::fs;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     static TEST_ID: AtomicU32 = AtomicU32::new(0);
     fn unique_dir(label: &str) -> std::path::PathBuf {
@@ -324,7 +369,15 @@ mod tests {
     fn push_and_get_from_buffer() {
         let (db, store, _dir) = setup();
         let k = serialize_value(&42u64);
-        store.push(TEST_TABLE.name(), k.clone(), serialize_value(&"hello".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"hello".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
 
         // Should be visible in buffer immediately.
         let found = store.get(TEST_TABLE.name(), &k).unwrap();
@@ -335,8 +388,24 @@ mod tests {
     #[test]
     fn flush_persists_to_db() {
         let (db, store, _dir) = setup();
-        store.push(TEST_TABLE.name(), serialize_value(&1u64), serialize_value(&"x".to_string()), &db, false).unwrap();
-        store.push(TEST_TABLE.name(), serialize_value(&2u64), serialize_value(&"y".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&1u64),
+                serialize_value(&"x".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&2u64),
+                serialize_value(&"y".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
 
         let n = store.flush(&db).expect("flush");
         assert_eq!(n, 2);
@@ -355,12 +424,36 @@ mod tests {
         let store = BufferStore::new(3);
         store.register_regular(TEST_TABLE);
 
-        store.push(TEST_TABLE.name(), serialize_value(&1u64), serialize_value(&"a".to_string()), &db, false).unwrap();
-        store.push(TEST_TABLE.name(), serialize_value(&2u64), serialize_value(&"b".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&1u64),
+                serialize_value(&"a".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&2u64),
+                serialize_value(&"b".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
         assert_eq!(store.len(), 2);
 
         // Third push → auto-flush.
-        store.push(TEST_TABLE.name(), serialize_value(&3u64), serialize_value(&"c".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&3u64),
+                serialize_value(&"c".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
         assert_eq!(store.len(), 0);
 
         let tx = db.begin_read().expect("read");
@@ -379,18 +472,71 @@ mod tests {
         let (db, store, _dir) = setup();
         let k = serialize_value(&10u64);
 
-        store.push(TEST_TABLE.name(), k.clone(), serialize_value(&"old".to_string()), &db, false).unwrap();
-        store.push(TEST_TABLE.name(), k.clone(), serialize_value(&"new".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"old".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"new".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
 
         let found = store.get(TEST_TABLE.name(), &k).unwrap();
         assert_eq!(String::from_bytes(&found), "new");
     }
 
     #[test]
+    fn overwrite_collapses_to_single_entry() {
+        let (db, store, _dir) = setup();
+        let k = serialize_value(&7u64);
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"a".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"b".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+
+        // Overwrite must not grow the buffer (no duplicate entries).
+        assert_eq!(store.len(), 1);
+        let found = store.get(TEST_TABLE.name(), &k).unwrap();
+        assert_eq!(String::from_bytes(&found), "b");
+    }
+
+    #[test]
     fn remove_from_buffer() {
         let (db, store, _dir) = setup();
         let k = serialize_value(&1u64);
-        store.push(TEST_TABLE.name(), k.clone(), serialize_value(&"x".to_string()), &db, false).unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"x".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
         assert!(store.get(TEST_TABLE.name(), &k).is_some());
 
         assert!(store.remove(TEST_TABLE.name(), &k));
@@ -398,8 +544,202 @@ mod tests {
     }
 
     #[test]
+    fn remove_drops_all_occurrences() {
+        let (db, store, _dir) = setup();
+        let k = serialize_value(&11u64);
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"old".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store
+            .push(
+                TEST_TABLE.name(),
+                k.clone(),
+                serialize_value(&"new".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+
+        assert!(store.remove(TEST_TABLE.name(), &k));
+        assert!(store.get(TEST_TABLE.name(), &k).is_none());
+        assert_eq!(store.len(), 0);
+
+        // A later flush must not resurrect the removed key.
+        let n = store.flush(&db).expect("flush");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
     fn remove_nonexistent_returns_false() {
         let (_db, store, _dir) = setup();
         assert!(!store.remove("no_table", b"no_key"));
+    }
+
+    #[test]
+    fn flush_empty_returns_zero() {
+        let (db, store, _dir) = setup();
+        assert_eq!(store.flush(&db).expect("flush"), 0);
+    }
+
+    #[test]
+    fn flush_error_keeps_entries() {
+        let (db, store, _dir) = setup();
+        let k = serialize_value(&1u64);
+        let v = serialize_value(&"value".to_string());
+        store
+            .push("unregistered_table", k.clone(), v.clone(), &db, false)
+            .unwrap();
+
+        let err = store.flush(&db).unwrap_err();
+        assert!(matches!(err, DbError::TableNotFound(_)));
+
+        // The failed batch is still in the buffer.
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("unregistered_table", &k).unwrap(), v);
+    }
+
+    #[test]
+    fn flush_partial_failure_keeps_all_entries() {
+        const GOOD: TableDefinition<u64, String> = TableDefinition::new("good_table");
+        let dir = unique_dir("buf_partial");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+        let path_s = path.to_str().unwrap().to_owned();
+        let db = Arc::new(Database::create(&path_s).expect("create"));
+        {
+            let tx = db.begin_write().expect("write");
+            tx.open_table(GOOD).expect("open");
+            tx.commit().expect("commit");
+        }
+        let store = BufferStore::new(100);
+        store.register_regular(GOOD);
+
+        let k1 = serialize_value(&1u64);
+        let k2 = serialize_value(&2u64);
+        let v1 = serialize_value(&"a".to_string());
+        let v2 = serialize_value(&"b".to_string());
+        store
+            .push(GOOD.name(), k1.clone(), v1.clone(), &db, false)
+            .unwrap();
+        store
+            .push("missing_table", k2.clone(), v2.clone(), &db, false)
+            .unwrap();
+
+        let err = store.flush(&db).unwrap_err();
+        assert!(matches!(err, DbError::TableNotFound(_)));
+
+        // Both the registered and the unregistered table's entries survive.
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(GOOD.name(), &k1).unwrap(), v1);
+        assert_eq!(store.get("missing_table", &k2).unwrap(), v2);
+    }
+
+    #[test]
+    fn on_flush_callback_runs() {
+        let (db, store, _dir) = setup();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        store.set_on_flush(Arc::new(move || {
+            calls2.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        store
+            .push(
+                TEST_TABLE.name(),
+                serialize_value(&1u64),
+                serialize_value(&"x".to_string()),
+                &db,
+                false,
+            )
+            .unwrap();
+        store.flush(&db).expect("flush");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Flushing an empty buffer still runs the callback (counter sync).
+        store.flush(&db).expect("flush");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_push_and_flush_no_loss() {
+        let (db, store, _dir) = setup();
+        let store = Arc::new(store);
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let s = store.clone();
+            let d = db.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..500u64 {
+                    let key = t * 1000 + i;
+                    s.push(
+                        TEST_TABLE.name(),
+                        serialize_value(&key),
+                        serialize_value(&format!("t{t}_{i}")),
+                        &d,
+                        false,
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        store.flush(&db).expect("flush");
+        assert_eq!(store.len(), 0);
+
+        let tx = db.begin_read().expect("read");
+        let table = tx.open_table(TEST_TABLE).expect("open");
+        for t in 0..8u64 {
+            for i in 0..500u64 {
+                let key = t * 1000 + i;
+                assert_eq!(
+                    table.get(key).unwrap().unwrap().value(),
+                    format!("t{t}_{i}"),
+                    "missing/incorrect key {key}"
+                );
+            }
+        }
+    }
+
+    // -- strip_varint -------------------------------------------------------
+
+    #[test]
+    fn strip_varint_empty() {
+        let empty: &[u8] = &[];
+        assert_eq!(strip_varint(empty), empty);
+    }
+
+    #[test]
+    fn strip_varint_single_byte_prefix() {
+        assert_eq!(strip_varint(&[5, 1, 2, 3]), &[1u8, 2, 3]);
+        assert_eq!(strip_varint(&[0]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn strip_varint_two_byte_prefix() {
+        let data = [254u8, 0x34, 0x12, 9, 9];
+        assert_eq!(strip_varint(&data), &[9u8, 9]);
+    }
+
+    #[test]
+    fn strip_varint_four_byte_prefix() {
+        let data = [255u8, 1, 0, 0, 0, 7, 8];
+        assert_eq!(strip_varint(&data), &[7u8, 8]);
+    }
+
+    #[test]
+    fn strip_varint_truncated_returns_input() {
+        assert_eq!(strip_varint(&[254, 1]), &[254u8, 1]);
+        assert_eq!(strip_varint(&[255, 1, 2]), &[255u8, 1, 2]);
+        assert_eq!(strip_varint(&[255, 1, 2, 3]), &[255u8, 1, 2, 3]);
     }
 }

@@ -1,11 +1,11 @@
 //! Integration tests for team-db — full lifecycle: open → write → flush → restore → verify.
 
 use std::fs;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
-use shodh_redb::{ReadableDatabase, TableDefinition, TableHandle, Value};
 use db_wrapper::DBWrapper;
+use shodh_redb::{ReadableDatabase, TableDefinition, TableHandle, Value};
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 fn unique_dir() -> String {
@@ -74,6 +74,74 @@ fn full_lifecycle_write_flush_restore_read() {
     assert_eq!(restored_counter, counter_val + 1); // +1 because we called next() after flush
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tuple_value_roundtrip() {
+    const TUPLE_T: TableDefinition<u64, (String, String)> = TableDefinition::new("tuple_probe");
+    let (db, _dir) = setup();
+    db.register_table(TUPLE_T);
+    let orig = ("hello".to_string(), "world".to_string());
+    db.write(TUPLE_T, 1u64, orig.clone()).expect("write");
+    db.flush_buffers().expect("flush");
+    let tx = db.db.begin_read().expect("read");
+    let table = tx.open_table(TUPLE_T).expect("open");
+    assert_eq!(table.get(1u64).unwrap().unwrap().value(), orig);
+}
+
+#[test]
+fn overwrite_then_remove_leaves_no_trace() {
+    let (db, _dir) = setup();
+    db.write(TEST_TABLE, 1u64, "old".to_string()).expect("w1");
+    db.write(TEST_TABLE, 1u64, "new".to_string()).expect("w2");
+    db.remove(TEST_TABLE, 1u64).expect("remove");
+    db.flush_buffers().expect("flush");
+
+    assert!(db.get(TEST_TABLE, 1u64).expect("get").is_none());
+    let tx = db.db.begin_read().expect("read");
+    let table = tx.open_table(TEST_TABLE).expect("open");
+    assert!(table.get(1u64).unwrap().is_none());
+}
+
+#[test]
+fn pending_writes_counts_unique_keys() {
+    let (db, _dir) = setup();
+    db.write(TEST_TABLE, 1u64, "a".to_string()).expect("w1");
+    db.write(TEST_TABLE, 1u64, "b".to_string()).expect("w2");
+    db.write(TEST_TABLE, 2u64, "c".to_string()).expect("w3");
+    // 2 unique keys, not 3 raw entries.
+    assert_eq!(db.pending_writes(), 2);
+}
+
+#[test]
+fn concurrent_writers_shared_key_last_write_wins() {
+    let (db, _dir) = setup();
+    let db = Arc::new(db);
+    let b1 = db.clone();
+    let b2 = db.clone();
+
+    let h1 = std::thread::spawn(move || {
+        for i in 0..200u64 {
+            b1.write(TEST_TABLE, 1u64, format!("t1_{i}")).expect("w");
+        }
+    });
+    let h2 = std::thread::spawn(move || {
+        for i in 0..200u64 {
+            b2.write(TEST_TABLE, 1u64, format!("t2_{i}")).expect("w");
+        }
+    });
+    h1.join().unwrap();
+    h2.join().unwrap();
+
+    db.flush_buffers().expect("flush");
+    let val = db.get(TEST_TABLE, 1u64).expect("get").expect("value");
+    let val = String::from_bytes(&val);
+    // The surviving value must be a complete value from one of the writers
+    // (the very last buffered write wins; which one depends on timing).
+    assert!(
+        val.starts_with("t1_") || val.starts_with("t2_"),
+        "unexpected value: {val}"
+    );
 }
 
 #[test]

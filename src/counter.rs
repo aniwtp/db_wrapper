@@ -16,8 +16,7 @@ use crate::db;
 // ---------------------------------------------------------------------------
 
 /// Blob table: stores the entire `[u64; 256]` array as `Vec<u8>`.
-pub(crate) const COUNTER_BLOB: TableDefinition<u8, Vec<u8>> =
-    TableDefinition::new("counter_blob");
+pub(crate) const COUNTER_BLOB: TableDefinition<u8, Vec<u8>> = TableDefinition::new("counter_blob");
 
 /// Fixed key for the single blob entry.
 pub(crate) const COUNTER_BLOB_KEY: u8 = 0;
@@ -49,13 +48,20 @@ impl CounterStore {
         let values = Box::new(std::array::from_fn(|i| AtomicU64::new(loaded[i])));
         let flushed = Mutex::new(loaded);
         log::debug!("CounterStore: initialised {COUNTER_SLOTS} slots from disk");
-        Ok(Self { values, flushed, db })
+        Ok(Self {
+            values,
+            flushed,
+            db,
+        })
     }
 
     fn load_all(db: &Database) -> Result<[u64; COUNTER_SLOTS], DbError> {
         let tx = db!(db.begin_read())?;
         let table = db!(tx.open_table(COUNTER_BLOB))?;
-        let bytes: Vec<u8> = match table.get(COUNTER_BLOB_KEY).map_err(|e| DbError::Redb(e.into()))? {
+        let bytes: Vec<u8> = match table
+            .get(COUNTER_BLOB_KEY)
+            .map_err(|e| DbError::Redb(e.into()))?
+        {
             Some(v) => v.value().clone(),
             None => return Ok([0u64; COUNTER_SLOTS]),
         };
@@ -73,11 +79,15 @@ impl CounterStore {
     }
 
     pub(crate) fn flush(&self) -> Result<usize, DbError> {
+        // The snapshot is taken *under* the mutex: if two flushes race, a
+        // snapshot taken outside the lock could be older than the value the
+        // other flush already wrote, and re-writing it would roll the
+        // counter back (breaking monotonicity after a restart).
+        let mut flushed = self.flushed.lock().unwrap();
         let mut snapshot = [0u64; COUNTER_SLOTS];
         for (i, v) in self.values.iter().enumerate() {
-            snapshot[i] = AtomicU64::load(v, Ordering::Relaxed);
+            snapshot[i] = v.load(Ordering::Relaxed);
         }
-        let mut flushed = self.flushed.lock().unwrap();
         if snapshot == *flushed {
             return Ok(0);
         }
@@ -137,8 +147,12 @@ mod tests {
     fn flush_and_restore() {
         let (db, _dir) = temp_db();
         let store = CounterStore::new(db.clone()).expect("new");
-        for _ in 0..10 { store.next(0); }
-        for _ in 0..5 { store.next(1); }
+        for _ in 0..10 {
+            store.next(0);
+        }
+        for _ in 0..5 {
+            store.next(1);
+        }
         store.next(255);
         let written = store.flush().expect("flush");
         assert_eq!(written, 1);
@@ -165,22 +179,88 @@ mod tests {
         let store = Arc::new(CounterStore::new(db).expect("new"));
         let store2 = store.clone();
         let handle = std::thread::spawn(move || {
-            for _ in 0..10_000 { store2.next(0); }
+            for _ in 0..10_000 {
+                store2.next(0);
+            }
         });
-        for _ in 0..100 { store.flush().ok(); }
+        for _ in 0..100 {
+            store.flush().ok();
+        }
         handle.join().unwrap();
         assert!(store.next(0) > 10_000);
+    }
+
+    #[test]
+    fn flush_never_rolls_back() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let (db, _dir) = temp_db();
+        let store = Arc::new(CounterStore::new(db.clone()).expect("new"));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let s_next = store.clone();
+        let st1 = stop.clone();
+        let h_next = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !st1.load(Ordering::Relaxed) {
+                s_next.next(0);
+                i += 1;
+            }
+            i
+        });
+
+        // Two flushers racing with the incrementer and each other.
+        let s_f1 = store.clone();
+        let st2 = stop.clone();
+        let h_f1 = std::thread::spawn(move || {
+            while !st2.load(Ordering::Relaxed) {
+                let _ = s_f1.flush();
+            }
+        });
+        let s_f2 = store.clone();
+        let st3 = stop.clone();
+        let h_f2 = std::thread::spawn(move || {
+            while !st3.load(Ordering::Relaxed) {
+                let _ = s_f2.flush();
+            }
+        });
+
+        // Repeatedly reload from disk: the persisted value must never go down.
+        let mut prev = 0u64;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(5));
+            let probe = CounterStore::new(db.clone()).expect("probe");
+            let cur = probe.next(0) - 1;
+            assert!(cur >= prev, "counter rolled back: {cur} < {prev}");
+            prev = cur;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let total = h_next.join().unwrap();
+        h_f1.join().unwrap();
+        h_f2.join().unwrap();
+
+        store.flush().expect("final flush");
+        let reloaded = CounterStore::new(db).expect("reload");
+        assert_eq!(reloaded.next(0) - 1, total);
     }
 
     #[test]
     fn all_256_slots_independent() {
         let (db, _dir) = temp_db();
         let store = CounterStore::new(db).expect("new");
-        for id in 0..=255u8 { assert_eq!(store.next(id), 1); }
-        for id in 0..=255u8 { assert_eq!(store.next(id), 2); }
+        for id in 0..=255u8 {
+            assert_eq!(store.next(id), 1);
+        }
+        for id in 0..=255u8 {
+            assert_eq!(store.next(id), 2);
+        }
         store.flush().expect("flush");
         let store2 = CounterStore::new(store.db.clone()).expect("new");
-        for id in 0..=255u8 { assert_eq!(store2.next(id) - 1, 2); }
+        for id in 0..=255u8 {
+            assert_eq!(store2.next(id) - 1, 2);
+        }
     }
 
     #[test]
@@ -195,7 +275,9 @@ mod tests {
         tx.open_table(COUNTER_BLOB).expect("open_table");
         tx.commit().expect("commit");
         let store = CounterStore::new(Arc::new(db)).expect("new");
-        for id in 0..=255u8 { assert_eq!(store.next(id) - 1, 0); }
+        for id in 0..=255u8 {
+            assert_eq!(store.next(id) - 1, 0);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -7,15 +7,15 @@
 //! - **Read-through**: `get_buffered()` checks buffers before falling back to DB.
 //! - **No async runtime**: flush is triggered manually or by size threshold.
 
-pub mod counter;
 pub mod buffer;
-pub mod wrapper;
+pub mod counter;
 pub mod error;
+pub mod wrapper;
 
-pub use wrapper::DBWrapper;
-pub use error::DbError;
 pub use buffer::serialize_value;
 pub use buffer::strip_varint;
+pub use error::DbError;
+pub use wrapper::DBWrapper;
 
 // ---------------------------------------------------------------------------
 // Internal helper macro — wraps redb calls into DbError::Redb

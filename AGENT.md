@@ -111,6 +111,23 @@ loop {
 - When buffers flush (manual or auto-max-size), counters flush first.
 - Result: counter values always hit disk before or with buffered data.
 
+### Schema migrations — `migrations.rs`
+
+- Schema version stored in the internal `_schema` table (`u8 key 0 → u64 version`),
+  created automatically in `DBWrapper::new`.
+- `Migration` trait: `from_version()`, `to_version()` (= from+1), `migrate(&DBWrapper)`.
+- Steps must be **idempotent**: data is rewritten first, the version bump is a
+  separate commit — a crash between them replays the step on next open.
+- `run_migrations()` is **explicit** (never runs on open); refuses downgrade
+  with `DbError::SchemaVersionTooNew`; serialized by an internal run-lock.
+
+```rust
+let db = DBWrapper::new("app.redb")?;
+db.register_migration_boxed(MigrateV1ToV2);
+db.register_migration_boxed(MigrateV2ToV3);
+let applied = db.run_migrations()?; // e.g. 2 on first launch after upgrade
+```
+
 ---
 
 ## API summary
@@ -123,8 +140,12 @@ loop {
 | `db.register_ttl_table(def, ttl)` | Register a TTL table |
 | `db.next(id) -> u64` | Atomic counter increment (~8 ns) |
 | `db.write(def, key, value)` | Buffer a write |
-| `db.write_ttl(def, key, value, ttl)` | Buffer a TTL write |
+| `db.write_ttl(def, key, value, ttl)` | Buffer a TTL write (per-write TTL preserved on flush) |
 | `db.get_buffered(table, key_bytes) -> Option<Vec<u8>>` | Look up in buffers |
+| `db.register_migration(Arc<dyn Migration>)` | Register a schema migration step |
+| `db.register_migration_boxed(m)` | Register an owned migration |
+| `db.schema_version() -> u64` | Current schema version (0 = fresh) |
+| `db.run_migrations() -> usize` | Apply pending migrations sequentially |
 | `db.flush_counters()` | Persist dirty counters |
 | `db.flush_buffers()` | Persist all buffered writes |
 | `db.compact()` | Run redb compaction |

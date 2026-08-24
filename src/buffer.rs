@@ -24,7 +24,11 @@ use crate::db;
 /// Knows how to flush a batch of raw (key_bytes, value_bytes) pairs
 /// into a specific redb table.  One instance per registered table.
 trait FlushTarget: Send + Sync {
-    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError>;
+    fn flush(
+        &self,
+        tx: &shodh_redb::WriteTransaction,
+        entries: &HashMap<Vec<u8>, PendingValue>,
+    ) -> Result<(), DbError>;
 }
 
 /// Concrete impl for a regular table.
@@ -35,17 +39,17 @@ struct RegularTarget<K: Key + 'static + Send + Sync, V: Value + 'static + Send +
 impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget
     for RegularTarget<K, V>
 {
-    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError> {
-        let tx = db!(db.begin_write())?;
-        {
-            let mut table = db!(tx.open_table(self.def))?;
-            for (k_bytes, v_bytes) in entries {
-                let k = K::from_bytes(k_bytes);
-                let v = V::from_bytes(v_bytes);
-                db!(table.insert(k, v))?;
-            }
+    fn flush(
+        &self,
+        tx: &shodh_redb::WriteTransaction,
+        entries: &HashMap<Vec<u8>, PendingValue>,
+    ) -> Result<(), DbError> {
+        let mut table = db!(tx.open_table(self.def))?;
+        for (k_bytes, pending) in entries {
+            let k = K::from_bytes(k_bytes);
+            let v = V::from_bytes(&pending.value_bytes);
+            db!(table.insert(k, v))?;
         }
-        db!(tx.commit())?;
         Ok(())
     }
 }
@@ -59,17 +63,18 @@ struct TtlTarget<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Syn
 impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarget
     for TtlTarget<K, V>
 {
-    fn flush(&self, db: &Database, entries: &HashMap<Vec<u8>, Vec<u8>>) -> Result<(), DbError> {
-        let tx = db!(db.begin_write())?;
-        {
-            let mut table = db!(tx.open_ttl_table(self.def))?;
-            for (k_bytes, v_bytes) in entries {
-                let k = K::from_bytes(k_bytes);
-                let v = V::from_bytes(v_bytes);
-                db!(table.insert_with_ttl(k, v, self.default_ttl))?;
-            }
+    fn flush(
+        &self,
+        tx: &shodh_redb::WriteTransaction,
+        entries: &HashMap<Vec<u8>, PendingValue>,
+    ) -> Result<(), DbError> {
+        let mut table = db!(tx.open_ttl_table(self.def))?;
+        for (k_bytes, pending) in entries {
+            let k = K::from_bytes(k_bytes);
+            let v = V::from_bytes(&pending.value_bytes);
+            let ttl = pending.ttl.unwrap_or(self.default_ttl);
+            db!(table.insert_with_ttl(k, v, ttl))?;
         }
-        db!(tx.commit())?;
         Ok(())
     }
 }
@@ -140,8 +145,16 @@ pub fn strip_varint(data: &[u8]) -> &[u8] {
 // BufferStore — one buffer for regular, one for TTL
 // ---------------------------------------------------------------------------
 
+/// Callback run before every flush (e.g., to sync counters to disk).
+type OnFlushCallback = Arc<dyn Fn() -> Result<(), DbError> + Send + Sync>;
+
 /// Pending (key bytes → value bytes) pairs for a single table.
-type TableEntries = HashMap<Vec<u8>, Vec<u8>>;
+type TableEntries = HashMap<Vec<u8>, PendingValue>;
+
+struct PendingValue {
+    value_bytes: Vec<u8>,
+    ttl: Option<Duration>,
+}
 
 /// A single buffer holding pending writes across all tables of one kind
 /// (regular or TTL).  Flushed manually, by size threshold, or on short TTL.
@@ -159,7 +172,9 @@ pub(crate) struct BufferStore {
     max_size: usize,
     /// Called right before any flush (manual or auto).
     /// Used to sync counters to disk alongside buffered data.
-    on_flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    on_flush: Mutex<Option<OnFlushCallback>>,
+    /// Serializes flushes so older and newer batches cannot commit out of order.
+    flush_lock: Mutex<()>,
 }
 
 impl BufferStore {
@@ -169,12 +184,20 @@ impl BufferStore {
             targets: Mutex::new(HashMap::new()),
             max_size,
             on_flush: Mutex::new(None),
+            flush_lock: Mutex::new(()),
         }
     }
 
     /// Set a callback invoked before every flush (e.g., to sync counters).
-    pub(crate) fn set_on_flush(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_on_flush(&self, cb: OnFlushCallback) {
         *self.on_flush.lock().unwrap() = Some(cb);
+    }
+
+    /// Acquire the flush serialization lock.  Held across a full
+    /// remove-from-buffer-and-DB cycle so an in-flight flush cannot commit
+    /// a batch containing a key that is being deleted.
+    pub(crate) fn lock_flush(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.flush_lock.lock().unwrap()
     }
 
     /// Register a regular table for flushing.
@@ -210,6 +233,18 @@ impl BufferStore {
         db: &Database,
         force_flush: bool,
     ) -> Result<(), DbError> {
+        self.push_with_ttl(table_name, key_bytes, value_bytes, db, force_flush, None)
+    }
+
+    pub(crate) fn push_with_ttl(
+        &self,
+        table_name: &str,
+        key_bytes: Vec<u8>,
+        value_bytes: Vec<u8>,
+        db: &Database,
+        force_flush: bool,
+        ttl: Option<Duration>,
+    ) -> Result<(), DbError> {
         let mut entries = self.entries.lock().unwrap();
         // Look up the table by `&str` first: no `String` allocation on the
         // hot path; a table name is only allocated the first time it appears.
@@ -217,7 +252,7 @@ impl BufferStore {
             Some(m) => m,
             None => entries.entry(table_name.to_owned()).or_default(),
         };
-        map.insert(key_bytes, value_bytes);
+        map.insert(key_bytes, PendingValue { value_bytes, ttl });
         let len: usize = entries.values().map(HashMap::len).sum();
         let should_flush = force_flush || (self.max_size > 0 && len >= self.max_size);
         drop(entries);
@@ -239,7 +274,7 @@ impl BufferStore {
             .unwrap()
             .get(table_name)
             .and_then(|m| m.get(key_bytes))
-            .cloned()
+            .map(|pending| pending.value_bytes.clone())
     }
 
     /// Remove a key from the buffer.  Drops every pending occurrence of the
@@ -274,11 +309,12 @@ impl BufferStore {
     /// buffer so no data is lost (entries that were already written are
     /// re-inserted idempotently on the next attempt).
     pub(crate) fn flush(&self, db: &Database) -> Result<usize, DbError> {
+        let _flush_guard = self.flush_lock.lock().unwrap();
         // Sync related state (e.g., counters) before writing buffered data.
         // Clone the Arc so the mutex is not held during the callback.
         let on_flush = self.on_flush.lock().unwrap().clone();
         if let Some(cb) = on_flush {
-            cb();
+            cb()?;
         }
 
         let mut entries = self.entries.lock().unwrap();
@@ -290,7 +326,9 @@ impl BufferStore {
 
         let count: usize = batch.values().map(HashMap::len).sum();
 
-        // Flush each table via its registered target.
+        // Flush all tables in one write transaction.  redb serializes writers,
+        // so opening one transaction is both faster and atomic across tables.
+        let tx = db!(db.begin_write())?;
         let targets = self.targets.lock().unwrap();
         let mut failure = None;
         for (name, pairs) in &batch {
@@ -302,7 +340,7 @@ impl BufferStore {
                     break;
                 }
             };
-            if let Err(e) = target.flush(db, pairs) {
+            if let Err(e) = target.flush(&tx, pairs) {
                 failure = Some(e);
                 break;
             }
@@ -310,8 +348,18 @@ impl BufferStore {
         drop(targets);
 
         if let Some(e) = failure {
-            // Put everything back; entries pushed concurrently after the
-            // `take` take precedence over the returned batch.
+            drop(tx);
+            let mut entries = self.entries.lock().unwrap();
+            for (name, pairs) in batch {
+                let map = entries.entry(name).or_default();
+                for (k, v) in pairs {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            return Err(e);
+        }
+
+        if let Err(e) = db!(tx.commit()) {
             let mut entries = self.entries.lock().unwrap();
             for (name, pairs) in batch {
                 let map = entries.entry(name).or_default();
@@ -648,6 +696,7 @@ mod tests {
         let calls2 = calls.clone();
         store.set_on_flush(Arc::new(move || {
             calls2.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }));
 
         store

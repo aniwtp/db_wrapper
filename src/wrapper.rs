@@ -1,6 +1,6 @@
 //! DBWrapper — database handle: open, compact, backup, buffers, maintenance.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use shodh_redb::ttl_table::TtlTableDefinition;
@@ -10,6 +10,7 @@ use crate::DbError;
 use crate::buffer::{BufferStore, serialize_value};
 use crate::counter::{BUFFER_FLUSH_SECS, BUFFER_MAX_ENTRIES, COUNTER_BLOB, CounterStore};
 use crate::db;
+use crate::migrations::ensure_schema_table;
 
 // ---------------------------------------------------------------------------
 // DBWrapper
@@ -22,6 +23,10 @@ pub struct DBWrapper {
     /// Unified buffer for TTL writes.
     ttl_buf: Arc<BufferStore>,
     counters: Arc<CounterStore>,
+    /// Registered schema migrations (shared with clones).
+    pub(crate) migrations: Arc<Mutex<Vec<Arc<dyn crate::migrations::Migration>>>>,
+    /// Serializes `run_migrations` across clones/threads.
+    pub(crate) migrations_run_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for DBWrapper {
@@ -31,6 +36,8 @@ impl Clone for DBWrapper {
             regular_buf: self.regular_buf.clone(),
             ttl_buf: self.ttl_buf.clone(),
             counters: self.counters.clone(),
+            migrations: self.migrations.clone(),
+            migrations_run_lock: self.migrations_run_lock.clone(),
         }
     }
 }
@@ -68,14 +75,13 @@ impl DBWrapper {
         db!(write_txn.commit())?;
 
         let counters = Arc::new(CounterStore::new(db_counter)?);
+        ensure_schema_table(&db)?;
 
         // Default buffer sizes: 10_000 entries before auto-flush.
         // Both buffers flush counters first (for approximate sync).
-        let on_flush: Arc<dyn Fn() + Send + Sync> = {
+        let on_flush: Arc<dyn Fn() -> Result<(), DbError> + Send + Sync> = {
             let c = counters.clone();
-            Arc::new(move || {
-                let _ = c.flush();
-            })
+            Arc::new(move || c.flush().map(|_| ()))
         };
         let regular_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES));
         regular_buf.set_on_flush(on_flush.clone());
@@ -88,6 +94,8 @@ impl DBWrapper {
             regular_buf,
             ttl_buf,
             counters,
+            migrations: Arc::new(Mutex::new(Vec::new())),
+            migrations_run_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -119,8 +127,7 @@ impl DBWrapper {
     /// Increment an atomic counter and return the new value.
     ///
     /// In-memory operation — counters are flushed to redb on explicit
-    /// `flush_counters`, before any buffer flush, and by `write_ttl`
-    /// with a TTL shorter than `BUFFER_FLUSH_SECS`.
+    /// `flush_counters` and before any buffer flush.
     pub fn next(&self, counter_id: u8) -> u64 {
         self.counters.next(counter_id)
     }
@@ -246,7 +253,7 @@ impl DBWrapper {
         let k_bytes = serialize_value(&key);
         let v_bytes = serialize_value(&value);
         self.ttl_buf
-            .push(def.name(), k_bytes, v_bytes, &self.db, force)
+            .push_with_ttl(def.name(), k_bytes, v_bytes, &self.db, force, Some(ttl))
     }
 
     // -- Read (buffer-first) -------------------------------------------------
@@ -315,6 +322,12 @@ impl DBWrapper {
         V: Value + Send + 'static,
     {
         let key_bytes = serialize_value(&key);
+
+        // Hold both buffers' flush locks for the whole remove cycle:
+        // otherwise a concurrent flush could take the key into its batch
+        // right after we clear the buffer and re-insert it into the DB.
+        let _r = self.regular_buf.lock_flush();
+        let _t = self.ttl_buf.lock_flush();
 
         // 1. Remove from both buffers (regular + TTL).
         let _ = self.regular_buf.remove(def.name(), &key_bytes);
@@ -621,6 +634,90 @@ mod tests {
         let tx = db.db.begin_read().expect("read");
         let table = tx.open_ttl_table(TTL_TABLE).expect("open");
         assert_eq!(table.get(1u64).unwrap().unwrap().value(), "buffered");
+    }
+
+    #[test]
+    fn write_ttl_preserves_per_write_ttl_after_flush() {
+        use shodh_redb::ttl_table::TtlTableDefinition;
+        const TTL_TABLE: TtlTableDefinition<u64, String> = TtlTableDefinition::new("test_ttl_keep");
+
+        let dir = unique_dir("wrapper_ttl_keep");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::new(data_path.to_str().unwrap()).expect("new");
+        // Registration default is 10 minutes.
+        db.register_ttl_table(TTL_TABLE, Duration::from_secs(600));
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Per-write TTL of 60s must win over the registration default (600s).
+        db.write_ttl(
+            TTL_TABLE,
+            1u64,
+            "short_lived".to_string(),
+            Duration::from_secs(60),
+        )
+        .expect("write_ttl");
+        db.flush_buffers().expect("flush");
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let tx = db.db.begin_read().expect("read");
+        let table = tx.open_ttl_table(TTL_TABLE).expect("open");
+        let guard = table.get(1u64).expect("get").expect("present");
+        assert_eq!(guard.value(), "short_lived");
+        let expires_at = guard.expires_at_ms();
+        // expiry ≈ now + 60s; if the registration default had been applied it
+        // would be ≈ now + 600s.
+        assert!(
+            expires_at <= after + 65_000,
+            "ttl from write_ttl was not preserved: expires_at={expires_at}, now≈{after}"
+        );
+        assert!(
+            expires_at >= before + 55_000,
+            "expiry implausibly early: expires_at={expires_at}"
+        );
+    }
+
+    #[test]
+    fn concurrent_remove_and_flush_never_resurrects_key() {
+        for _ in 0..20 {
+            let (db, dir) = open_db();
+
+            db.write(TEST_TABLE, 1u64, "value".to_string())
+                .expect("write");
+
+            let d1 = db.clone();
+            let d2 = db.clone();
+            let h_flush = std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let _ = d1.flush_buffers();
+                }
+            });
+            let h_remove = std::thread::spawn(move || {
+                d2.remove(TEST_TABLE, 1u64).expect("remove");
+            });
+
+            h_flush.join().unwrap();
+            h_remove.join().unwrap();
+
+            db.flush_buffers().expect("final flush");
+            let tx = db.db.begin_read().expect("read");
+            let table = tx.open_table(TEST_TABLE).expect("open");
+            assert!(
+                table.get(1u64).unwrap().is_none(),
+                "removed key resurrected by a racing flush"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

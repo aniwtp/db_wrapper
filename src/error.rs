@@ -14,4 +14,16 @@ pub enum DbError {
     /// The requested table does not exist or wasn't registered.
     #[error("table `{0}` not found or not registered")]
     TableNotFound(String),
+
+    /// The requested table was registered with an incompatible kind or type.
+    #[error("table `{0}` was registered with an incompatible definition")]
+    TableDefinitionMismatch(String),
+
+    /// The database file's schema version is newer than the running binary
+    /// supports (downgrade attempt).
+    #[error("database schema v{file_version} is newer than supported v{supported_version}")]
+    SchemaVersionTooNew {
+        file_version: u64,
+        supported_version: u64,
+    },
 }

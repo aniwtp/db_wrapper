@@ -10,6 +10,7 @@
 pub mod buffer;
 pub mod counter;
 pub mod error;
+pub mod migrations;
 pub mod wrapper;
 
 pub use buffer::serialize_value;

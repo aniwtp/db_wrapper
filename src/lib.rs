@@ -10,12 +10,14 @@
 pub mod buffer;
 pub mod counter;
 pub mod error;
+pub mod group_commit;
 pub mod migrations;
 pub mod wrapper;
 
 pub use buffer::serialize_value;
 pub use buffer::strip_varint;
 pub use error::DbError;
+pub use group_commit::CommitPolicy;
 pub use wrapper::DBWrapper;
 
 // ---------------------------------------------------------------------------

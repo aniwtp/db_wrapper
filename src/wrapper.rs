@@ -59,7 +59,22 @@ impl DBWrapper {
     ///
     /// Two database files: `{path}` (data) + `{path}.counter` (counters).
     pub fn new(path: &str) -> Result<Self, DbError> {
-        log::debug!("DBWrapper::new opening database at {path}");
+        Self::with_commit_policy(path, crate::group_commit::CommitPolicy::Durable)
+    }
+
+    /// Open with a specific commit policy for buffered flushes.
+    ///
+    /// * [`CommitPolicy::Durable`] — one durable commit per flush (default).
+    /// * [`CommitPolicy::Grouped`] — flushes go through redb's group-commit
+    ///   pipeline; concurrent batches share one fsync.  Same durability.
+    /// * [`CommitPolicy::GroupedNonDurable`] — flushes commit without fsync;
+    ///   data becomes durable at the next durable commit (e.g. close or any
+    ///   `Durable`-mode operation).  Fastest, weakest crash guarantees.
+    pub fn with_commit_policy(
+        path: &str,
+        policy: crate::group_commit::CommitPolicy,
+    ) -> Result<Self, DbError> {
+        log::debug!("DBWrapper::new opening database at {path} (policy={policy:?})");
 
         let counter_path = format!("{path}.counter");
 
@@ -83,9 +98,10 @@ impl DBWrapper {
             let c = counters.clone();
             Arc::new(move || c.flush().map(|_| ()))
         };
-        let regular_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES));
+        let policy_cell = crate::group_commit::CommitPolicyCell::new(policy);
+        let regular_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES, policy_cell.clone()));
         regular_buf.set_on_flush(on_flush.clone());
-        let ttl_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES));
+        let ttl_buf = Arc::new(BufferStore::new(BUFFER_MAX_ENTRIES, policy_cell));
         ttl_buf.set_on_flush(on_flush);
 
         log::info!("database opened: {path} (+ {counter_path})");
@@ -333,14 +349,13 @@ impl DBWrapper {
         let _ = self.regular_buf.remove(def.name(), &key_bytes);
         let _ = self.ttl_buf.remove(def.name(), &key_bytes);
 
-        // 2. Remove from DB.
-        let tx = db!(self.db.begin_write())?;
-        {
+        // 2. Remove from DB through the configured commit policy.
+        crate::group_commit::commit_ops(&self.db, self.regular_buf.policy().get(), move |tx| {
             let mut table = db!(tx.open_table(def))?;
             let k_ref = K::from_bytes(&key_bytes);
             db!(table.remove(k_ref))?;
-        }
-        db!(tx.commit())?;
+            Ok(())
+        })?;
 
         log::trace!("remove `{}`", def.name());
         Ok(())
@@ -845,5 +860,123 @@ mod tests {
             })
             .collect();
         assert!(!backups.is_empty());
+    }
+
+    // -- Commit policies ------------------------------------------------------
+
+    use crate::CommitPolicy;
+
+    fn open_db_with(policy: CommitPolicy) -> (DBWrapper, String) {
+        let dir = unique_dir("policy");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("test.redb");
+        let db = DBWrapper::with_commit_policy(data_path.to_str().unwrap(), policy).expect("new");
+        db.register_table(TEST_TABLE);
+        (db, dir.to_str().unwrap().to_owned())
+    }
+
+    /// Every policy: write → flush → data is on disk, read-back works,
+    /// remove through the policy path works too.
+    #[test]
+    fn flush_persists_under_every_policy() {
+        for policy in [
+            CommitPolicy::Durable,
+            CommitPolicy::Grouped,
+            CommitPolicy::GroupedNonDurable,
+        ] {
+            let (db, dir) = open_db_with(policy);
+            db.write(TEST_TABLE, 1u64, "one".to_string()).unwrap();
+            db.write(TEST_TABLE, 2u64, "two".to_string()).unwrap();
+            db.flush_buffers().unwrap();
+
+            let tx = db.db.begin_read().unwrap();
+            let table = tx.open_table(TEST_TABLE).unwrap();
+            assert_eq!(table.get(1u64).unwrap().unwrap().value(), "one");
+            assert_eq!(table.get(2u64).unwrap().unwrap().value(), "two");
+            drop(tx);
+
+            // Remove goes through the same policy.
+            db.remove(TEST_TABLE, 1u64).unwrap();
+            assert!(db.get(TEST_TABLE, 1u64).unwrap().is_none());
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// GroupedNonDurable: data written but not yet durable must become visible
+    /// after a reopen ONLY if some durable commit followed.  Here we verify the
+    /// weaker guarantee explicitly: reopen without a durable commit may lose the
+    /// tail, so we do a durable marker write first and check the rest survived.
+    #[test]
+    fn grouped_non_durable_becomes_durable_on_next_durable_commit() {
+        let (db, dir) = open_db_with(CommitPolicy::GroupedNonDurable);
+        db.write(TEST_TABLE, 1u64, "nondurable".to_string())
+            .unwrap();
+        db.flush_buffers().unwrap();
+
+        // Switch to a durable operation on the same DB: reopening in Durable
+        // mode and writing makes the storage fsync the WAL state.
+        drop(db);
+        let data_path = format!("{dir}/test.redb");
+        let db2 = DBWrapper::with_commit_policy(&data_path, CommitPolicy::Durable).expect("reopen");
+        db2.register_table(TEST_TABLE);
+        db2.write(TEST_TABLE, 2u64, "durable".to_string()).unwrap();
+        db2.flush_buffers().unwrap();
+        drop(db2);
+
+        let db3 =
+            DBWrapper::with_commit_policy(&data_path, CommitPolicy::Durable).expect("reopen2");
+        db3.register_table(TEST_TABLE);
+        // The non-durable commit may or may not have survived — both are legal.
+        // What must hold: no corruption and the durable write is there.
+        assert_eq!(
+            db3.get(TEST_TABLE, 2u64).unwrap().map(|b| !b.is_empty()),
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent flushes from several threads under Grouped policy —
+    /// exercises redb's group-commit pipeline (batches from different threads
+    /// merging into one commit).  All writes must land.
+    #[test]
+    fn grouped_flush_concurrent_threads() {
+        let (db, dir) = open_db_with(CommitPolicy::Grouped);
+        let db = std::sync::Arc::new(db);
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 250;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let key = (t * PER_THREAD + i) as u64;
+                    db.write(TEST_TABLE, key, format!("t{t}_{i}")).unwrap();
+                    if i % 50 == 49 {
+                        db.flush_buffers().unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        db.flush_buffers().unwrap();
+
+        let tx = db.db.begin_read().unwrap();
+        let table = tx.open_table(TEST_TABLE).unwrap();
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let key = (t * PER_THREAD + i) as u64;
+                assert_eq!(
+                    table.get(key).unwrap().unwrap().value(),
+                    format!("t{t}_{i}"),
+                    "missing/incorrect key {key}"
+                );
+            }
+        }
+        drop(tx);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

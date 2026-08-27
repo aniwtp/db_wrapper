@@ -16,6 +16,7 @@ use shodh_redb::{Database, Key, TableDefinition, TableHandle, Value};
 
 use crate::DbError;
 use crate::db;
+use crate::group_commit::CommitPolicyCell;
 
 // ---------------------------------------------------------------------------
 // FlushTarget — type-erased flush handler for a single table
@@ -174,7 +175,7 @@ pub(crate) struct BufferStore {
     /// Pending entries per table: table name → (key bytes → value bytes).
     entries: Mutex<HashMap<String, TableEntries>>,
     /// How to flush each table.  Populated by `register_*`.
-    targets: Mutex<HashMap<String, Arc<dyn FlushTarget>>>,
+    targets: Arc<Mutex<HashMap<String, Arc<dyn FlushTarget>>>>,
     /// Max pending entries before auto-flush (0 = no limit).
     max_size: usize,
     /// Called right before any flush (manual or auto).
@@ -182,17 +183,26 @@ pub(crate) struct BufferStore {
     on_flush: Mutex<Option<OnFlushCallback>>,
     /// Serializes flushes so older and newer batches cannot commit out of order.
     flush_lock: Mutex<()>,
+    /// Commit strategy for flush batches (Durable / Grouped / GroupedNonDurable).
+    policy: CommitPolicyCell,
 }
 
 impl BufferStore {
-    pub(crate) fn new(max_size: usize) -> Self {
+    pub(crate) fn new(max_size: usize, policy: CommitPolicyCell) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            targets: Mutex::new(HashMap::new()),
+            targets: Arc::new(Mutex::new(HashMap::new())),
             max_size,
             on_flush: Mutex::new(None),
             flush_lock: Mutex::new(()),
+            policy,
         }
+    }
+
+    /// Expose the buffer's commit policy for callers that run their own
+    /// immediate operations (e.g. `remove`) through the same path.
+    pub(crate) fn policy(&self) -> CommitPolicyCell {
+        self.policy.clone()
     }
 
     /// Set a callback invoked before every flush (e.g., to sync counters).
@@ -332,55 +342,68 @@ impl BufferStore {
         drop(entries);
 
         let count: usize = batch.values().map(HashMap::len).sum();
+        let table_count = batch.len();
 
-        // Flush all tables in one write transaction.  redb serializes writers,
-        // so opening one transaction is both faster and atomic across tables.
-        let tx = db!(db.begin_write())?;
-        let targets = self.targets.lock().unwrap();
-        let mut failure = None;
-        for (name, pairs) in &batch {
-            let target = match targets.get(name) {
-                Some(t) => t,
-                None => {
-                    log::error!("BufferStore::flush: no target registered for table `{name}`");
-                    failure = Some(DbError::TableNotFound(name.clone()));
-                    break;
+        // Commit through the configured policy: Durable opens a dedicated
+        // transaction, Grouped submits into redb's group-commit pipeline
+        // (merging with any concurrent batch, e.g. from the TTL buffer),
+        // GroupedNonDurable commits without fsync.  All tables of the batch
+        // share one transaction/commit in every mode.
+        //
+        // The batch lives in a shared slot so that on failure whatever was not
+        // consumed by the closure can be put back into the buffer (data-loss
+        // prevention).  `commit_ops` invokes the closure at most once.
+        let targets = self.targets.clone();
+        let slot: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, TableEntries>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(batch)));
+        let slot_for_closure = slot.clone();
+        let result = crate::group_commit::commit_ops(db, self.policy.get(), move |tx| {
+            let taken = slot_for_closure
+                .lock()
+                .unwrap()
+                .take()
+                .expect("commit_ops invokes the closure at most once");
+            let targets = targets.lock().unwrap();
+            match (|| {
+                for (name, pairs) in &taken {
+                    let target = targets.get(name).ok_or_else(|| {
+                        log::error!("BufferStore::flush: no target registered for table `{name}`");
+                        DbError::TableNotFound(name.clone())
+                    })?;
+                    target.flush(tx, pairs)?;
                 }
-            };
-            if let Err(e) = target.flush(&tx, pairs) {
-                failure = Some(e);
-                break;
-            }
-        }
-        drop(targets);
-
-        if let Some(e) = failure {
-            drop(tx);
-            let mut entries = self.entries.lock().unwrap();
-            for (name, pairs) in batch {
-                let map = entries.entry(name).or_default();
-                for (k, v) in pairs {
-                    map.entry(k).or_insert(v);
-                }
-            }
-            return Err(e);
-        }
-
-        if let Err(e) = db!(tx.commit()) {
-            let mut entries = self.entries.lock().unwrap();
-            for (name, pairs) in batch {
-                let map = entries.entry(name).or_default();
-                for (k, v) in pairs {
-                    map.entry(k).or_insert(v);
+                Ok(())
+            })() {
+                Ok(()) => Ok(()),
+                // Transaction is not committed (or, in grouped mode, the whole
+                // group rolls back) — hand the full batch back for a retry.
+                Err(e) => {
+                    *slot_for_closure.lock().unwrap() = Some(taken);
+                    Err(e)
                 }
             }
-            return Err(e);
+        });
+
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                // Put back whatever the closure left behind (full batch on
+                // failure — the aborted transaction persisted none of it).
+                let leftover = slot.lock().unwrap().take();
+                if let Some(batch) = leftover {
+                    let mut entries = self.entries.lock().unwrap();
+                    for (name, pairs) in batch {
+                        let map = entries.entry(name).or_default();
+                        for (k, v) in pairs {
+                            map.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
 
-        log::debug!(
-            "BufferStore::flush: {count} entries across {} tables",
-            batch.len()
-        );
+        log::debug!("BufferStore::flush: {count} entries across {table_count} tables");
         Ok(count)
     }
 }
@@ -415,7 +438,10 @@ mod tests {
         tx.open_table(TEST_TABLE).expect("open");
         tx.commit().expect("commit");
 
-        let store = BufferStore::new(100);
+        let store = BufferStore::new(
+            100,
+            crate::group_commit::CommitPolicyCell::new(crate::group_commit::CommitPolicy::Durable),
+        );
         store.register_regular(TEST_TABLE);
         (db, store, dir.to_str().unwrap().to_owned())
     }
@@ -476,7 +502,10 @@ mod tests {
     fn auto_flush_on_max_size() {
         let (db, _store, _dir) = setup();
         // Override max_size.
-        let store = BufferStore::new(3);
+        let store = BufferStore::new(
+            3,
+            crate::group_commit::CommitPolicyCell::new(crate::group_commit::CommitPolicy::Durable),
+        );
         store.register_regular(TEST_TABLE);
 
         store
@@ -673,7 +702,10 @@ mod tests {
             tx.open_table(GOOD).expect("open");
             tx.commit().expect("commit");
         }
-        let store = BufferStore::new(100);
+        let store = BufferStore::new(
+            100,
+            crate::group_commit::CommitPolicyCell::new(crate::group_commit::CommitPolicy::Durable),
+        );
         store.register_regular(GOOD);
 
         let k1 = serialize_value(&1u64);

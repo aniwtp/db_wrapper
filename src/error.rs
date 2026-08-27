@@ -26,4 +26,8 @@ pub enum DbError {
         file_version: u64,
         supported_version: u64,
     },
+
+    /// Group-commit pipeline rejected the batch.
+    #[error("group commit error: {0}")]
+    GroupCommit(#[from] shodh_redb::GroupCommitError),
 }

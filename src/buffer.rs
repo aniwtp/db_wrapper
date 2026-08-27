@@ -109,8 +109,12 @@ pub fn serialize_value<T: Value>(value: &T) -> Vec<u8> {
 /// Redb's [`Value`] impl for `Vec<T>` prepends a varint-encoded element count.
 /// Use this to recover the raw inner bytes when storing blob data as `Vec<u8>`.
 ///
-/// Returns the bytes after the varint prefix.  Returns the original slice
-/// unchanged if the data is too short to contain a valid varint.
+/// The prefix is only stripped when the declared element count actually matches
+/// the remaining byte count.  This matters for `Vec<u8>` blobs: blob payloads
+/// themselves frequently start with a varint-looking byte (e.g. postcard LEB128
+/// timestamps), and a blind prefix strip would silently corrupt such payloads.
+/// If the declared length doesn't match — or the data is too short to contain
+/// a valid varint — the original slice is returned unchanged.
 ///
 /// # Example
 ///
@@ -120,25 +124,28 @@ pub fn serialize_value<T: Value>(value: &T) -> Vec<u8> {
 /// let item: MyType = postcard::from_bytes(raw.unwrap())?;
 /// ```
 pub fn strip_varint(data: &[u8]) -> &[u8] {
+    fn decode(data: &[u8]) -> Option<(usize, usize)> {
+        match data[0] {
+            n @ 0..=253 => Some((n as usize, 1)),
+            254 if data.len() >= 3 => Some((u16::from_le_bytes([data[1], data[2]]) as usize, 3)),
+            255 if data.len() >= 5 => Some((
+                u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize,
+                5,
+            )),
+            _ => None,
+        }
+    }
+
     if data.is_empty() {
         return data;
     }
-    let consumed = match data[0] {
-        0..=253 => 1,
-        254 => {
-            if data.len() < 3 {
-                return data;
-            }
-            3
-        }
-        255 => {
-            if data.len() < 5 {
-                return data;
-            }
-            5
-        }
-    };
-    &data[consumed..]
+    match decode(data) {
+        // Exact fit: this really is a redb Vec<T> prefix — strip it.
+        Some((len, hdr)) if data.len() - hdr == len => &data[hdr..],
+        // Declared length doesn't match the payload: not a prefix (or a corrupt
+        // one) — either way stripping would corrupt the data.
+        _ => data,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -768,20 +775,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_varint_single_byte_prefix() {
-        assert_eq!(strip_varint(&[5, 1, 2, 3]), &[1u8, 2, 3]);
+    fn strip_varint_strips_exact_prefix() {
+        // 1-byte prefix: claims 3 elements, 3 remain.
+        assert_eq!(strip_varint(&[3, 1, 2, 3]), &[1u8, 2, 3]);
+        // 0 elements, empty payload.
         assert_eq!(strip_varint(&[0]), &[] as &[u8]);
     }
 
     #[test]
     fn strip_varint_two_byte_prefix() {
-        let data = [254u8, 0x34, 0x12, 9, 9];
+        // 254 marker + u16 LE len: claims 2, exactly 2 remain.
+        let data = [254u8, 0x02, 0x00, 9, 9];
         assert_eq!(strip_varint(&data), &[9u8, 9]);
     }
 
     #[test]
     fn strip_varint_four_byte_prefix() {
-        let data = [255u8, 1, 0, 0, 0, 7, 8];
+        // 255 marker + u32 LE len: claims 2, exactly 2 remain.
+        let data = [255u8, 2, 0, 0, 0, 7, 8];
         assert_eq!(strip_varint(&data), &[7u8, 8]);
     }
 
@@ -790,5 +801,41 @@ mod tests {
         assert_eq!(strip_varint(&[254, 1]), &[254u8, 1]);
         assert_eq!(strip_varint(&[255, 1, 2]), &[255u8, 1, 2]);
         assert_eq!(strip_varint(&[255, 1, 2, 3]), &[255u8, 1, 2, 3]);
+        assert_eq!(strip_varint(&[255]), &[255u8]);
+    }
+
+    /// Regression: a blob whose payload itself starts with a varint-looking
+    /// byte (postcard LEB128 of a unix timestamp starts with 0xFF) must be
+    /// returned unchanged — the declared length never matches the payload.
+    #[test]
+    fn strip_varint_rejects_payload_that_mimics_prefix() {
+        // postcard TitleInfo starts with date_create = 1787837567 (LEB128:
+        // ff f8 c0 d4 06). Blind stripping ate 5 bytes and corrupted the row.
+        let payload: Vec<u8> = [0xFFu8, 0xF8, 0xC0, 0xD4, 0x06, 0x01]
+            .iter()
+            .copied()
+            .chain([0u8; 20])
+            .collect();
+        assert_eq!(
+            strip_varint(&payload),
+            &payload[..],
+            "mimicking payload must not be stripped"
+        );
+
+        // The 0xFE marker variant of the same hazard.
+        let payload_fe: Vec<u8> = [0xFEu8, 0x34, 0x12]
+            .iter()
+            .copied()
+            .chain([0u8; 7])
+            .collect();
+        assert_eq!(strip_varint(&payload_fe), &payload_fe[..]);
+    }
+
+    /// Prefix length mismatch in the other direction: real prefix claims fewer
+    /// bytes than remain (corrupt or not a prefix) — leave the data alone.
+    #[test]
+    fn strip_varint_length_mismatch_returns_input() {
+        let data = [7u8, 1, 2, 3, 4]; // claims 7, only 4 remain
+        assert_eq!(strip_varint(&data), &data[..]);
     }
 }

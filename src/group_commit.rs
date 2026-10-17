@@ -23,7 +23,7 @@
 //! reasoning about crash guarantees impossible.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use shodh_redb::WriteBatch;
 
@@ -62,18 +62,49 @@ impl CommitPolicy {
     }
 }
 
+/// shodh-redb refuses another `Durability::None` commit once this many are
+/// pending without a durable commit in between ("a durable commit is
+/// required"); at the default 10 s flush interval that is reached after ~28
+/// hours and every later flush would fail.
+const REDB_MAX_PENDING_NON_DURABLE: u32 = 10_000;
+
+/// `GroupedNonDurable` therefore makes every `NON_DURABLE_CHECKPOINT_EVERY`-th
+/// commit a durable one.  That is only ever *stronger* than the policy's
+/// promise, and costs one fsync per 256 flushes.
+pub(crate) const NON_DURABLE_CHECKPOINT_EVERY: u32 = 256;
+const _: () = assert!(NON_DURABLE_CHECKPOINT_EVERY < REDB_MAX_PENDING_NON_DURABLE);
+
 /// Runtime holder for the selected policy (interior mutability not needed:
-/// the policy is fixed after open, the atomic only makes `&self` sharing easy).
+/// the policy is fixed after open, the atomic only makes `&self` sharing easy)
+/// plus the count of non-durable commits since the last durable checkpoint.
 #[derive(Debug, Clone)]
-pub(crate) struct CommitPolicyCell(Arc<AtomicU8>);
+pub(crate) struct CommitPolicyCell(Arc<CommitPolicyState>);
+
+#[derive(Debug)]
+struct CommitPolicyState {
+    policy: AtomicU8,
+    non_durable_since_checkpoint: AtomicU32,
+}
 
 impl CommitPolicyCell {
     pub(crate) fn new(policy: CommitPolicy) -> Self {
-        Self(Arc::new(AtomicU8::new(policy.id())))
+        Self(Arc::new(CommitPolicyState {
+            policy: AtomicU8::new(policy.id()),
+            non_durable_since_checkpoint: AtomicU32::new(0),
+        }))
     }
 
     pub(crate) fn get(&self) -> CommitPolicy {
-        CommitPolicy::from_id(self.0.load(Ordering::Relaxed))
+        CommitPolicy::from_id(self.0.policy.load(Ordering::Relaxed))
+    }
+
+    /// Whether the next non-durable commit has to be a durable checkpoint.
+    fn non_durable_commit_is_checkpoint(&self) -> bool {
+        let n = self
+            .0
+            .non_durable_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed);
+        (n + 1).is_multiple_of(NON_DURABLE_CHECKPOINT_EVERY)
     }
 }
 
@@ -86,13 +117,13 @@ impl CommitPolicyCell {
 /// group-commit pipeline, where it merges with whatever else is in flight.
 pub(crate) fn commit_ops<F>(
     db: &shodh_redb::Database,
-    policy: CommitPolicy,
+    policy: &CommitPolicyCell,
     op: F,
 ) -> Result<(), DbError>
 where
     F: FnOnce(&shodh_redb::WriteTransaction) -> Result<(), DbError> + Send + 'static,
 {
-    match policy {
+    match policy.get() {
         // redb group-commit pipeline: our batch merges with whatever other
         // batches are in flight; one durable commit (fsync) per group.
         CommitPolicy::Grouped => {
@@ -113,7 +144,9 @@ where
         // transaction committing at Durability::None (no fsync on this path).
         CommitPolicy::GroupedNonDurable => {
             let mut tx = db!(db.begin_write())?;
-            db!(tx.set_durability(shodh_redb::Durability::None))?;
+            if !policy.non_durable_commit_is_checkpoint() {
+                db!(tx.set_durability(shodh_redb::Durability::None))?;
+            }
             match op(&tx) {
                 Ok(()) => db!(tx.commit()),
                 Err(e) => {

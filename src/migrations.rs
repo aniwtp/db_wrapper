@@ -54,7 +54,7 @@ impl DBWrapper {
     /// [`Self::run_migrations`] applies steps strictly sequentially by
     /// version.
     pub fn register_migration(&self, m: Arc<dyn Migration>) {
-        self.migrations.lock().unwrap().push(m);
+        self.migrations.lock().push(m);
     }
 
     /// Convenience wrapper: register an owned migration.
@@ -81,7 +81,7 @@ impl DBWrapper {
     pub fn run_migrations(&self) -> Result<usize, DbError> {
         // One runner at a time (per DBWrapper instance tree): two racing
         // callers would otherwise both pick the same pending step.
-        let _run_guard = self.migrations_run_lock.lock().unwrap();
+        let _run_guard = self.migrations_run_lock.lock();
         let mut applied = 0usize;
         loop {
             let current = self.schema_version()?;
@@ -90,7 +90,6 @@ impl DBWrapper {
             let next = self
                 .migrations
                 .lock()
-                .unwrap()
                 .iter()
                 .find(|m| m.from_version() == current)
                 .cloned();
@@ -99,12 +98,11 @@ impl DBWrapper {
                 let max_known = self
                     .migrations
                     .lock()
-                    .unwrap()
                     .iter()
                     .map(|m| m.to_version())
                     .max()
                     .unwrap_or(0);
-                if current > max_known && !self.migrations.lock().unwrap().is_empty() {
+                if current > max_known && !self.migrations.lock().is_empty() {
                     return Err(DbError::SchemaVersionTooNew {
                         file_version: current,
                         supported_version: max_known,
@@ -128,17 +126,10 @@ impl DBWrapper {
     }
 }
 
-/// Create the internal `_schema` table.  Called from `DBWrapper::new`.
+/// Create the internal `_schema` table if missing.  Called from
+/// `DBWrapper::new`; a no-op (no write transaction) on an existing database.
 pub(crate) fn ensure_schema_table(db: &Database) -> Result<(), DbError> {
-    let tx = db!(db.begin_write())?;
-    {
-        let table = tx.open_table(SCHEMA_TABLE);
-        drop(table);
-        if let Err(e) = tx.commit() {
-            return Err(DbError::Redb(e.into()));
-        }
-    }
-    Ok(())
+    crate::wrapper::ensure_table(db, SCHEMA_TABLE)
 }
 
 fn read_schema_version(db: &Database) -> Result<u64, DbError> {
@@ -468,7 +459,7 @@ mod tests {
         let clone = db.clone();
         clone.register_migration_boxed(RenameValues);
         // Registered through the clone must be visible via the original.
-        assert_eq!(db.migrations.lock().unwrap().len(), 1);
+        assert_eq!(db.migrations.lock().len(), 1);
         fs::remove_dir_all(dir).ok();
     }
 }

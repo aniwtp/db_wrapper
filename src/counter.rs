@@ -3,8 +3,10 @@
 //! Hot path (`next`) is a single `AtomicU64::fetch_add` — no locks, no hashing.
 //! Counters are persisted as a single 2048-byte blob under one key.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 
 use shodh_redb::{Database, ReadableDatabase, TableDefinition};
 
@@ -34,10 +36,18 @@ pub const BUFFER_MAX_ENTRIES: usize = 10_000;
 // CounterStore
 // ---------------------------------------------------------------------------
 
+/// One counter, padded to its own cache line.
+///
+/// Without padding eight adjacent counters share a 64-byte line, so threads
+/// bumping *different* ids still ping-pong the line between cores (false
+/// sharing).  16 KiB for 256 slots buys independent scaling per counter.
+#[repr(align(64))]
+struct Slot(AtomicU64);
+
 /// Holds the hot in-memory counter values and flushes them to redb
 /// periodically.  Only writes values that changed since the last flush.
 pub(crate) struct CounterStore {
-    values: Box<[AtomicU64; COUNTER_SLOTS]>,
+    values: Box<[Slot; COUNTER_SLOTS]>,
     flushed: Mutex<[u64; COUNTER_SLOTS]>,
     db: Arc<Database>,
 }
@@ -45,7 +55,7 @@ pub(crate) struct CounterStore {
 impl CounterStore {
     pub(crate) fn new(db: Arc<Database>) -> Result<Self, DbError> {
         let loaded = Self::load_all(&db)?;
-        let values = Box::new(std::array::from_fn(|i| AtomicU64::new(loaded[i])));
+        let values = Box::new(std::array::from_fn(|i| Slot(AtomicU64::new(loaded[i]))));
         let flushed = Mutex::new(loaded);
         log::debug!("CounterStore: initialised {COUNTER_SLOTS} slots from disk");
         Ok(Self {
@@ -62,20 +72,23 @@ impl CounterStore {
             .get(COUNTER_BLOB_KEY)
             .map_err(|e| DbError::Redb(e.into()))?
         {
-            Some(v) => v.value().clone(),
+            Some(v) => v.value(),
             None => return Ok([0u64; COUNTER_SLOTS]),
         };
         let mut arr = [0u64; COUNTER_SLOTS];
-        for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-            let chunk: [u8; 8] = chunk.try_into().unwrap();
-            arr[i] = u64::from_le_bytes(chunk);
+        // `zip` stops at the slot array end: an oversized blob cannot overflow it.
+        for (slot, chunk) in arr.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *slot = u64::from_le_bytes(*chunk);
         }
         Ok(arr)
     }
 
     #[inline(always)]
     pub(crate) fn next(&self, counter_id: u8) -> u64 {
-        self.values[counter_id as usize].fetch_add(1, Ordering::Relaxed) + 1
+        self.values[counter_id as usize]
+            .0
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 
     pub(crate) fn flush(&self) -> Result<usize, DbError> {
@@ -83,10 +96,10 @@ impl CounterStore {
         // snapshot taken outside the lock could be older than the value the
         // other flush already wrote, and re-writing it would roll the
         // counter back (breaking monotonicity after a restart).
-        let mut flushed = self.flushed.lock().unwrap();
+        let mut flushed = self.flushed.lock();
         let mut snapshot = [0u64; COUNTER_SLOTS];
         for (i, v) in self.values.iter().enumerate() {
-            snapshot[i] = v.load(Ordering::Relaxed);
+            snapshot[i] = v.0.load(Ordering::Relaxed);
         }
         if snapshot == *flushed {
             return Ok(0);
@@ -279,5 +292,21 @@ mod tests {
             assert_eq!(store.next(id) - 1, 0);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_blob_does_not_panic() {
+        let (db, _dir) = temp_db();
+        // 300 u64 values: 44 more than there are slots.
+        let blob: Vec<u8> = (1..=300u64).flat_map(|v| v.to_le_bytes()).collect();
+        let tx = db.begin_write().expect("begin_write");
+        {
+            let mut table = tx.open_table(COUNTER_BLOB).expect("open_table");
+            table.insert(COUNTER_BLOB_KEY, blob).expect("insert");
+        }
+        tx.commit().expect("commit");
+        let store = CounterStore::new(db).expect("oversized blob must load");
+        assert_eq!(store.next(0), 2);
+        assert_eq!(store.next(255), 257);
     }
 }

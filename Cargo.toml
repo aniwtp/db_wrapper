@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hashbrown = "0.15"
 log = "0.4"
-shodh-redb = { version = "0.5.0", features = ["compression_lz4"] }
+parking_lot = "0.12"
+# Needs the umzi2/shodh-redb-fork performance branch: the key-ordered flush in
+# `BufferStore::flush` relies on its ascending-insert leaf packing.  Against crates.io
+# `shodh-redb 0.6.0` an ascending flush splits every leaf in half (2x file size, slower inserts).
+shodh-redb = { git = "https://github.com/umzi2/shodh-redb-fork", branch = "perf/upstream-port", features = ["compression_lz4"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]

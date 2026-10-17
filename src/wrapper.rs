@@ -1,17 +1,73 @@
 //! DBWrapper — database handle: open, compact, backup, buffers, maintenance.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use shodh_redb::ttl_table::TtlTableDefinition;
 use shodh_redb::{Database, Key, ReadableDatabase, TableDefinition, TableHandle, Value};
 
 use crate::DbError;
-use crate::buffer::{BufferStore, serialize_value};
+use crate::buffer::{BufferStore, serialize_value, serialized_ref};
 use crate::counter::{BUFFER_FLUSH_SECS, BUFFER_MAX_ENTRIES, COUNTER_BLOB, CounterStore};
 use crate::db;
 use crate::migrations::ensure_schema_table;
 
+/// Page-cache budget for the tiny counter database.
+const COUNTER_DB_CACHE_BYTES: usize = 1024 * 1024;
+
+/// Create a regular table if it does not exist yet.
+///
+/// Existence is checked in a read transaction; a write transaction (and its
+/// fsync) is only paid when the table really has to be created, i.e. on the
+/// first open of a fresh database — not on every restart.
+pub(crate) fn ensure_table<K, V>(
+    db: &Database,
+    def: TableDefinition<'static, K, V>,
+) -> Result<(), DbError>
+where
+    K: Key + 'static,
+    V: Value + 'static,
+{
+    {
+        let rtx = db!(db.begin_read())?;
+        match rtx.open_table(def) {
+            Ok(_) => return Ok(()),
+            Err(shodh_redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(DbError::Redb(e.into())),
+        }
+    }
+    let wtx = db!(db.begin_write())?;
+    {
+        db!(wtx.open_table(def))?;
+    }
+    db!(wtx.commit())
+}
+
+/// TTL-table counterpart of [`ensure_table`].
+pub(crate) fn ensure_ttl_table<K, V>(
+    db: &Database,
+    def: TtlTableDefinition<K, V>,
+) -> Result<(), DbError>
+where
+    K: Key + 'static,
+    V: Value + 'static,
+{
+    {
+        let rtx = db!(db.begin_read())?;
+        match rtx.open_ttl_table(def) {
+            Ok(_) => return Ok(()),
+            Err(shodh_redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(DbError::Redb(e.into())),
+        }
+    }
+    let wtx = db!(db.begin_write())?;
+    {
+        db!(wtx.open_ttl_table(def))?;
+    }
+    db!(wtx.commit())
+}
 // ---------------------------------------------------------------------------
 // DBWrapper
 // ---------------------------------------------------------------------------
@@ -74,20 +130,47 @@ impl DBWrapper {
         path: &str,
         policy: crate::group_commit::CommitPolicy,
     ) -> Result<Self, DbError> {
+        Self::open(path, policy, None)
+    }
+
+    /// Like [`with_commit_policy`](Self::with_commit_policy) with an explicit
+    /// page-cache budget (bytes) for the main database.
+    ///
+    /// Without it redb sizes the cache from physical RAM (25 %, between
+    /// 16 MiB and 1 GiB), which on a small container can be the dominant
+    /// memory consumer.  The budget is a ceiling enforced by eviction.
+    pub fn with_cache_size(
+        path: &str,
+        policy: crate::group_commit::CommitPolicy,
+        cache_bytes: usize,
+    ) -> Result<Self, DbError> {
+        Self::open(path, policy, Some(cache_bytes))
+    }
+
+    fn open(
+        path: &str,
+        policy: crate::group_commit::CommitPolicy,
+        cache_bytes: Option<usize>,
+    ) -> Result<Self, DbError> {
         log::debug!("DBWrapper::new opening database at {path} (policy={policy:?})");
 
         let counter_path = format!("{path}.counter");
 
-        let db = Arc::new(db!(Database::create(path))?);
-        let write_txn = db!(db.begin_write())?;
-        db!(write_txn.commit())?;
+        let db = {
+            let mut builder = Database::builder();
+            if let Some(bytes) = cache_bytes {
+                builder.set_cache_size(bytes);
+            }
+            Arc::new(db!(builder.create(path))?)
+        };
 
-        let db_counter = Arc::new(db!(Database::create(&counter_path))?);
-        let write_txn = db!(db_counter.begin_write())?;
-        {
-            db!(write_txn.open_table(COUNTER_BLOB))?;
-        }
-        db!(write_txn.commit())?;
+        // The counter database holds one 2 KiB blob: a 1 MiB page cache is
+        // plenty, versus the main database's RAM-proportional default
+        // (16 MiB – 1 GiB ceiling).
+        let db_counter = Arc::new(db!(Database::builder()
+            .set_cache_size(COUNTER_DB_CACHE_BYTES)
+            .create(&counter_path))?);
+        ensure_table(&db_counter, COUNTER_BLOB)?;
 
         let counters = Arc::new(CounterStore::new(db_counter)?);
         ensure_schema_table(&db)?;
@@ -155,16 +238,26 @@ impl DBWrapper {
 
     // -- Backup --------------------------------------------------------------
 
-    /// Create a timestamped backup inside the `backups/` directory.
+    /// Create a timestamped backup inside the backup directory.
+    ///
+    /// Pending buffered writes are flushed first, so the snapshot contains
+    /// everything written before the call.
+    ///
+    /// Directory comes from `BACKUP_DIR` env (prod: `/backups/<svc>` — один
+    /// примонтированный диск на все бэкенды, у каждого свой подкаталог).
+    /// Default `backups` — локальная разработка, старое поведение.
     pub fn backup(&self) -> Result<(), DbError> {
+        // Pending buffered writes (and counters, flushed alongside) would
+        // otherwise be missing from the snapshot.
+        self.flush_buffers()?;
         log::debug!("starting database backup");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let backup_dir = "backups";
-        std::fs::create_dir_all(backup_dir).inspect_err(|e| {
+        let backup_dir = std::env::var("BACKUP_DIR").unwrap_or_else(|_| "backups".to_owned());
+        std::fs::create_dir_all(&backup_dir).inspect_err(|e| {
             log::error!("failed to create backup dir {backup_dir}: {e}");
         })?;
 
@@ -185,23 +278,13 @@ impl DBWrapper {
         K: Key + Send + Sync + 'static,
         V: Value + Send + Sync + 'static,
     {
-        // Ensure table exists.  Failure to open a transaction is non-fatal
-        // here: `open_table` inside a write transaction also creates the
-        // table, so a later flush will create it even if this call failed.
-        let tx = match self.db.begin_write() {
-            Ok(tx) => tx,
-            Err(e) => {
-                log::error!("register_table `{}`: begin_write failed: {e}", def.name());
-                self.regular_buf.register_regular(def);
-                return;
-            }
-        };
-        {
-            let table = tx.open_table(def);
-            drop(table);
-            if let Err(e) = tx.commit() {
-                log::error!("register_table `{}`: commit failed: {e}", def.name());
-            }
+        // Ensure the table exists (so DB-fallback reads never hit
+        // `TableDoesNotExist` for a table that was never flushed).  Existing
+        // tables are detected with a read transaction: no commit, no fsync.
+        // Failure is non-fatal: `open_table` inside a flush's write
+        // transaction also creates the table.
+        if let Err(e) = ensure_table(&self.db, def) {
+            log::error!("register_table `{}`: {e}", def.name());
         }
         self.regular_buf.register_regular(def);
         log::debug!("registered regular table `{}`", def.name());
@@ -213,23 +296,8 @@ impl DBWrapper {
         K: Key + Send + Sync + 'static,
         V: Value + Send + Sync + 'static,
     {
-        let tx = match self.db.begin_write() {
-            Ok(tx) => tx,
-            Err(e) => {
-                log::error!(
-                    "register_ttl_table `{}`: begin_write failed: {e}",
-                    def.name()
-                );
-                self.ttl_buf.register_ttl(def, default_ttl);
-                return;
-            }
-        };
-        {
-            let table = tx.open_ttl_table(def);
-            drop(table);
-            if let Err(e) = tx.commit() {
-                log::error!("register_ttl_table `{}`: commit failed: {e}", def.name());
-            }
+        if let Err(e) = ensure_ttl_table(&self.db, def) {
+            log::error!("register_ttl_table `{}`: {e}", def.name());
         }
         self.ttl_buf.register_ttl(def, default_ttl);
         log::debug!("registered TTL table `{}`", def.name());
@@ -246,10 +314,13 @@ impl DBWrapper {
         K: Key + Send + 'static,
         V: Value + Send + 'static,
     {
-        let k_bytes = serialize_value(&key);
-        let v_bytes = serialize_value(&value);
-        self.regular_buf
-            .push(def.name(), k_bytes, v_bytes, &self.db, false)
+        self.regular_buf.push(
+            def.name(),
+            serialized_ref(&key).as_ref(),
+            serialized_ref(&value).as_ref(),
+            &self.db,
+            false,
+        )
     }
 
     /// Write a key-value pair to the TTL buffer.
@@ -266,10 +337,14 @@ impl DBWrapper {
         V: Value + Send + 'static,
     {
         let force = ttl < Duration::from_secs(BUFFER_FLUSH_SECS);
-        let k_bytes = serialize_value(&key);
-        let v_bytes = serialize_value(&value);
-        self.ttl_buf
-            .push_with_ttl(def.name(), k_bytes, v_bytes, &self.db, force, Some(ttl))
+        self.ttl_buf.push_with_ttl(
+            def.name(),
+            serialized_ref(&key).as_ref(),
+            serialized_ref(&value).as_ref(),
+            &self.db,
+            force,
+            Some(ttl),
+        )
     }
 
     // -- Read (buffer-first) -------------------------------------------------
@@ -307,17 +382,19 @@ impl DBWrapper {
         K: Key + Send + 'static,
         V: Value + Send + 'static,
     {
-        let key_bytes = serialize_value(&key);
+        // Borrow the serialised key: reads never need an owned copy.
+        let key_holder = serialized_ref(&key);
+        let key_bytes: &[u8] = key_holder.as_ref();
 
         // 1. Buffer-first — catches unflushed writes.
-        if let Some(v_bytes) = self.get_buffered(def.name(), &key_bytes) {
+        if let Some(v_bytes) = self.get_buffered(def.name(), key_bytes) {
             return Ok(Some(v_bytes));
         }
 
         // 2. DB fallback — use from_bytes to get SelfType (avoids Borrow<SelfType> HRTB).
         let tx = db!(self.db.begin_read())?;
         let table = db!(tx.open_table(def))?;
-        let k_ref = K::from_bytes(&key_bytes);
+        let k_ref = K::from_bytes(key_bytes);
         if let Some(guard) = db!(table.get(k_ref))? {
             let v_bytes = V::as_bytes(&guard.value()).as_ref().to_vec();
             return Ok(Some(v_bytes));
@@ -350,7 +427,7 @@ impl DBWrapper {
         let _ = self.ttl_buf.remove(def.name(), &key_bytes);
 
         // 2. Remove from DB through the configured commit policy.
-        crate::group_commit::commit_ops(&self.db, self.regular_buf.policy().get(), move |tx| {
+        crate::group_commit::commit_ops(&self.db, &self.regular_buf.policy(), move |tx| {
             let mut table = db!(tx.open_table(def))?;
             let k_ref = K::from_bytes(&key_bytes);
             db!(table.remove(k_ref))?;
@@ -846,20 +923,55 @@ mod tests {
     }
 
     #[test]
-    fn backup_creates_file() {
+    fn with_cache_size_roundtrip_and_reopen() {
+        let dir = unique_dir("wrapper_cache_size");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+        let path = path.to_str().unwrap();
+
+        {
+            let db = DBWrapper::with_cache_size(path, CommitPolicy::Durable, 4 << 20).expect("new");
+            db.register_table(TEST_TABLE);
+            db.write(TEST_TABLE, 1u64, "v1".to_string()).expect("write");
+            db.flush_buffers().expect("flush");
+        }
+        // Reopen: table/schema already exist → registration must not need a
+        // write transaction, and the data must still be there.
+        let db = DBWrapper::with_cache_size(path, CommitPolicy::Durable, 4 << 20).expect("reopen");
+        db.register_table(TEST_TABLE);
+        let got = db.get(TEST_TABLE, 1u64).expect("get").expect("row");
+        assert_eq!(String::from_bytes(&got), "v1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_contains_buffered_writes() {
         let (db, _dir) = open_db();
+        // Only in the buffer — backup() must flush it before snapshotting.
+        db.write(TEST_TABLE, 4242u64, "unflushed".to_string())
+            .expect("write");
         db.backup().expect("backup");
-        let backups: Vec<_> = fs::read_dir("backups")
+
+        let newest = fs::read_dir("backups")
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.starts_with("redb_"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(!backups.is_empty());
+            .filter(|e| e.file_name().to_string_lossy().starts_with("redb_"))
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+            .expect("a backup file")
+            .path();
+        let copy = unique_dir("backup_copy").with_extension("redb");
+        fs::copy(&newest, &copy).unwrap();
+        let _ = fs::remove_file(&newest);
+
+        let restored = Database::open(&copy).expect("open backup");
+        let tx = restored.begin_read().expect("read");
+        let table = tx.open_table(TEST_TABLE).expect("table");
+        assert_eq!(
+            table.get(4242u64).unwrap().expect("row in backup").value(),
+            "unflushed"
+        );
+        let _ = fs::remove_file(&copy);
     }
 
     // -- Commit policies ------------------------------------------------------
@@ -874,6 +986,31 @@ mod tests {
         let db = DBWrapper::with_commit_policy(data_path.to_str().unwrap(), policy).expect("new");
         db.register_table(TEST_TABLE);
         (db, dir.to_str().unwrap().to_owned())
+    }
+
+    /// shodh-redb refuses further `Durability::None` commits after 10 000 of
+    /// them without a durable one.  A host flushing every 10 s would hit that
+    /// after ~28 hours; `GroupedNonDurable` must checkpoint on its own.
+    #[test]
+    fn grouped_non_durable_survives_more_flushes_than_redb_allows_pending() {
+        let (db, dir) = open_db_with(CommitPolicy::GroupedNonDurable);
+        for i in 0..10_600u64 {
+            db.write(TEST_TABLE, i % 50, format!("v{i}"))
+                .expect("write");
+            db.flush_buffers()
+                .unwrap_or_else(|e| panic!("flush #{i} failed: {e}"));
+        }
+        let got = db.get(TEST_TABLE, 49u64).expect("get").expect("row");
+        assert_eq!(String::from_bytes(&got), "v10599");
+
+        // The data survives a close + reopen.
+        drop(db);
+        let path = format!("{dir}/test.redb");
+        let db = DBWrapper::new(&path).expect("reopen");
+        db.register_table(TEST_TABLE);
+        let got = db.get(TEST_TABLE, 49u64).expect("get").expect("row");
+        assert_eq!(String::from_bytes(&got), "v10599");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Every policy: write → flush → data is on disk, read-back works,

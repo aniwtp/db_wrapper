@@ -9,7 +9,7 @@ unified write buffers, and read-through lookups.  No async runtime dependency.
 
 ```
 db-wrapper/
-├── Cargo.toml              # shodh-redb + log + thiserror
+├── Cargo.toml              # shodh-redb + hashbrown + parking_lot + log + thiserror
 ├── AGENT.md                # ← this file
 ├── README.md
 │
@@ -35,10 +35,10 @@ db-wrapper/
 # Dev build
 cargo build
 
-# Tests (20 unit + 4 integration)
+# Tests (67 unit + 8 integration)
 cargo test
 
-# Benchmarks
+# Benchmarks (data dir: /var/tmp, override BENCH_DIR — NOT tmpfs, fsync must be real)
 cargo bench
 
 # Lint
@@ -149,7 +149,8 @@ let applied = db.run_migrations()?; // e.g. 2 on first launch after upgrade
 | `db.flush_counters()` | Persist dirty counters |
 | `db.flush_buffers()` | Persist all buffered writes |
 | `db.compact()` | Run redb compaction |
-| `db.backup()` | Create timestamped backup |
+| `db.backup()` | Flush buffers, then create timestamped backup (`BACKUP_DIR` env, default `backups/`) |
+| `DBWrapper::with_cache_size(path, policy, bytes)` | Open with a capped page cache for the main DB (default: 25 % RAM, 16 MiB–1 GiB) |
 | `db.pending_writes() -> usize` | Buffered entries count |
 
 ---
@@ -170,7 +171,35 @@ let applied = db.run_migrations()?; // e.g. 2 on first launch after upgrade
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `shodh-redb` | 0.5 | Embedded K/V database (TTL fork) |
+| `shodh-redb` | 0.6 (umzi2 fork, `perf/upstream-port`) | Embedded K/V database (TTL fork) |
+| `hashbrown` | 0.15 | Buffer maps: `entry_ref` (one hash, lazy key allocation) + foldhash |
+| `parking_lot` | 0.12 | Non-poisoning, faster `Mutex` |
 | `log` | 0.4 | Lightweight logging facade |
 | `thiserror` | 2.0 | Derive `Error` for enums |
 | `criterion` | 0.5 | Dev — benchmarks |
+
+---
+
+## Performance notes
+
+- Buffer maps use `hashbrown` (foldhash, per-process random seed): one hash per
+  `push`; an overwrite of a pending key reuses its allocations (zero allocs).
+- `BufferStore` keeps the total entry count incrementally (`Inner.len`), so
+  `push` is O(1) regardless of table count.
+- Flush inserts each table's batch in **ascending key order** (`sorted_by_key`, using the table's
+  own `Key::compare`).  This only pays off with the fork's ascending-insert leaf packing: sequential
+  ids then append to dense leaves (500k rows: 585 ms vs 773-1035 ms hash order, RSS 163 vs 227 MB).
+  On crates.io `shodh-redb 0.6.0` the same order halves leaf fill (257 -> 514 MiB file), so
+  `Cargo.toml` points at the fork.  Random keys gain ~3 % from locality.
+- `GroupedNonDurable` makes every 256th flush a durable checkpoint.  shodh-redb refuses further
+  `Durability::None` commits after 10 000 pending ones; at the default 10 s flush interval that is
+  ~28 h, after which every flush failed.
+- `CounterStore` slots are cache-line padded (`#[repr(align(64))]`, 16 KiB):
+  4 threads on distinct ids scale ~23× better than with packed `AtomicU64`s.
+- Open/register skip write transactions when tables already exist
+  (`ensure_table` checks in a read txn) — no fsync per table on restart.
+- Counter DB uses a fixed 1 MiB page cache.
+- TTL entries expire `ttl` after the **write**, not after the flush that
+  persists them (`PendingValue.deadline`).
+- Known non-optimisable cost: `Database` drop = ~3.3 ms per file (redb marks the
+  file clean with an fsync); two files per `DBWrapper`.

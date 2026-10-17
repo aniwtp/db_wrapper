@@ -7,10 +7,12 @@
 //! Flushing is triggered manually, by the size threshold, or by a short TTL —
 //! there is no background maintenance loop.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
+use parking_lot::Mutex;
+use std::time::{Duration, Instant};
+
+use hashbrown::HashMap;
 use shodh_redb::ttl_table::TtlTableDefinition;
 use shodh_redb::{Database, Key, TableDefinition, TableHandle, Value};
 
@@ -32,6 +34,15 @@ trait FlushTarget: Send + Sync {
     ) -> Result<(), DbError>;
 }
 
+/// Pending entries of one table in ascending order of the table's key comparator.
+fn sorted_by_key<K: Key>(
+    entries: &HashMap<Vec<u8>, PendingValue>,
+) -> Vec<(&Vec<u8>, &PendingValue)> {
+    let mut items: Vec<_> = entries.iter().collect();
+    items.sort_unstable_by(|a, b| K::compare(a.0, b.0));
+    items
+}
+
 /// Concrete impl for a regular table.
 struct RegularTarget<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> {
     def: TableDefinition<'static, K, V>,
@@ -46,7 +57,7 @@ impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarg
         entries: &HashMap<Vec<u8>, PendingValue>,
     ) -> Result<(), DbError> {
         let mut table = db!(tx.open_table(self.def))?;
-        for (k_bytes, pending) in entries {
+        for (k_bytes, pending) in sorted_by_key::<K>(entries) {
             let k = K::from_bytes(k_bytes);
             let v = V::from_bytes(&pending.value_bytes);
             db!(table.insert(k, v))?;
@@ -70,10 +81,17 @@ impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarg
         entries: &HashMap<Vec<u8>, PendingValue>,
     ) -> Result<(), DbError> {
         let mut table = db!(tx.open_ttl_table(self.def))?;
-        for (k_bytes, pending) in entries {
+        let now = Instant::now();
+        for (k_bytes, pending) in sorted_by_key::<K>(entries) {
             let k = K::from_bytes(k_bytes);
             let v = V::from_bytes(&pending.value_bytes);
-            let ttl = pending.ttl.unwrap_or(self.default_ttl);
+            // The TTL runs from the moment of the write, not from the flush:
+            // remaining = deadline - now (zero → already expired, inserted
+            // with a zero TTL so it still supersedes any older stored value).
+            let ttl = match pending.deadline {
+                Some(deadline) => deadline.saturating_duration_since(now),
+                None => self.default_ttl,
+            };
             db!(table.insert_with_ttl(k, v, ttl))?;
         }
         Ok(())
@@ -94,8 +112,13 @@ impl<K: Key + 'static + Send + Sync, V: Value + 'static + Send + Sync> FlushTarg
 /// these have the same layout as the source type, so the pointer cast is
 /// sound.  `K::from_bytes`/`V::from_bytes` are used on the flush side to
 /// recover `SelfType` from the raw bytes.
-unsafe fn as_self_type_ref<T: Value>(value: &T) -> &T::SelfType<'_> {
+pub(crate) unsafe fn as_self_type_ref<T: Value>(value: &T) -> &T::SelfType<'_> {
     unsafe { &*(value as *const T as *const T::SelfType<'_>) }
+}
+
+/// Borrow the serialised form of a `Value` without copying it.
+pub(crate) fn serialized_ref<T: Value>(value: &T) -> T::AsBytes<'_> {
+    T::as_bytes(unsafe { as_self_type_ref(value) })
 }
 
 /// Serialise a `Value` to bytes.
@@ -161,7 +184,22 @@ type TableEntries = HashMap<Vec<u8>, PendingValue>;
 
 struct PendingValue {
     value_bytes: Vec<u8>,
-    ttl: Option<Duration>,
+    /// Moment the entry's TTL runs out (`write time + ttl`); `None` = the
+    /// table's default TTL applies at flush time.
+    deadline: Option<Instant>,
+}
+
+/// Pending entries of all tables, keyed by table name.
+type TableMap<V> = HashMap<String, V>;
+
+/// Everything guarded by the buffer mutex: per-table entries plus the total
+/// entry count, maintained incrementally so `push` stays O(1) regardless of
+/// how many tables are live.
+#[derive(Default)]
+struct Inner {
+    tables: TableMap<TableEntries>,
+    /// Sum of `tables[*].len()`.
+    len: usize,
 }
 
 /// A single buffer holding pending writes across all tables of one kind
@@ -173,7 +211,7 @@ struct PendingValue {
 /// drops every occurrence of it.
 pub(crate) struct BufferStore {
     /// Pending entries per table: table name → (key bytes → value bytes).
-    entries: Mutex<HashMap<String, TableEntries>>,
+    entries: Mutex<Inner>,
     /// How to flush each table.  Populated by `register_*`.
     targets: Arc<Mutex<HashMap<String, Arc<dyn FlushTarget>>>>,
     /// Max pending entries before auto-flush (0 = no limit).
@@ -190,7 +228,7 @@ pub(crate) struct BufferStore {
 impl BufferStore {
     pub(crate) fn new(max_size: usize, policy: CommitPolicyCell) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(Inner::default()),
             targets: Arc::new(Mutex::new(HashMap::new())),
             max_size,
             on_flush: Mutex::new(None),
@@ -207,14 +245,14 @@ impl BufferStore {
 
     /// Set a callback invoked before every flush (e.g., to sync counters).
     pub(crate) fn set_on_flush(&self, cb: OnFlushCallback) {
-        *self.on_flush.lock().unwrap() = Some(cb);
+        *self.on_flush.lock() = Some(cb);
     }
 
     /// Acquire the flush serialization lock.  Held across a full
     /// remove-from-buffer-and-DB cycle so an in-flight flush cannot commit
     /// a batch containing a key that is being deleted.
-    pub(crate) fn lock_flush(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.flush_lock.lock().unwrap()
+    pub(crate) fn lock_flush(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.flush_lock.lock()
     }
 
     /// Register a regular table for flushing.
@@ -227,7 +265,7 @@ impl BufferStore {
     ) {
         let name = def.name().to_owned();
         let target: Arc<dyn FlushTarget> = Arc::new(RegularTarget { def });
-        self.targets.lock().unwrap().insert(name, target);
+        self.targets.lock().insert(name, target);
     }
 
     /// Register a TTL table for flushing.
@@ -238,41 +276,63 @@ impl BufferStore {
     ) {
         let name = def.name().to_owned();
         let target: Arc<dyn FlushTarget> = Arc::new(TtlTarget { def, default_ttl });
-        self.targets.lock().unwrap().insert(name, target);
+        self.targets.lock().insert(name, target);
     }
 
     /// Push a serialised key-value pair.  Auto-flushes if max_size is reached.
     pub(crate) fn push(
         &self,
         table_name: &str,
-        key_bytes: Vec<u8>,
-        value_bytes: Vec<u8>,
+        key_bytes: impl AsRef<[u8]>,
+        value_bytes: impl AsRef<[u8]>,
         db: &Database,
         force_flush: bool,
     ) -> Result<(), DbError> {
         self.push_with_ttl(table_name, key_bytes, value_bytes, db, force_flush, None)
     }
 
+    /// Like [`push`](Self::push) with an explicit per-entry TTL.
+    ///
+    /// Key and value are taken as slices: when the key is already pending its
+    /// existing allocations are reused (overwrite in place), so a repeated
+    /// write performs no allocation at all.
     pub(crate) fn push_with_ttl(
         &self,
         table_name: &str,
-        key_bytes: Vec<u8>,
-        value_bytes: Vec<u8>,
+        key_bytes: impl AsRef<[u8]>,
+        value_bytes: impl AsRef<[u8]>,
         db: &Database,
         force_flush: bool,
         ttl: Option<Duration>,
     ) -> Result<(), DbError> {
-        let mut entries = self.entries.lock().unwrap();
-        // Look up the table by `&str` first: no `String` allocation on the
-        // hot path; a table name is only allocated the first time it appears.
-        let map = match entries.get_mut(table_name) {
-            Some(m) => m,
-            None => entries.entry(table_name.to_owned()).or_default(),
-        };
-        map.insert(key_bytes, PendingValue { value_bytes, ttl });
-        let len: usize = entries.values().map(HashMap::len).sum();
+        let key_bytes = key_bytes.as_ref();
+        let value_bytes = value_bytes.as_ref();
+        // Clamp so `Instant + Duration` cannot overflow on absurd TTLs
+        // (u32::MAX seconds ≈ 136 years).
+        let deadline = ttl.map(|t| Instant::now() + t.min(Duration::from_secs(u32::MAX as u64)));
+        let mut guard = self.entries.lock();
+        let inner = &mut *guard;
+        // `entry_ref` hashes once and only allocates an owned `String` / `Vec`
+        // when the table / key is not yet present.
+        let map = inner.tables.entry_ref(table_name).or_default();
+        match map.entry_ref(key_bytes) {
+            hashbrown::hash_map::EntryRef::Occupied(mut e) => {
+                let pending = e.get_mut();
+                pending.value_bytes.clear();
+                pending.value_bytes.extend_from_slice(value_bytes);
+                pending.deadline = deadline;
+            }
+            hashbrown::hash_map::EntryRef::Vacant(e) => {
+                e.insert(PendingValue {
+                    value_bytes: value_bytes.to_vec(),
+                    deadline,
+                });
+                inner.len += 1;
+            }
+        }
+        let len = inner.len;
         let should_flush = force_flush || (self.max_size > 0 && len >= self.max_size);
-        drop(entries);
+        drop(guard);
 
         log::trace!("BufferStore::push → `{table_name}` (pending: {len})");
 
@@ -288,7 +348,7 @@ impl BufferStore {
     pub(crate) fn get(&self, table_name: &str, key_bytes: &[u8]) -> Option<Vec<u8>> {
         self.entries
             .lock()
-            .unwrap()
+            .tables
             .get(table_name)
             .and_then(|m| m.get(key_bytes))
             .map(|pending| pending.value_bytes.clone())
@@ -298,25 +358,24 @@ impl BufferStore {
     /// key (repeated writes collapse into one entry).  Returns `true` if an
     /// entry was removed.
     pub(crate) fn remove(&self, table_name: &str, key_bytes: &[u8]) -> bool {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(map) = entries.get_mut(table_name) {
-            let existed = map.remove(key_bytes).is_some();
-            if map.is_empty() {
-                entries.remove(table_name);
-            }
-            return existed;
+        let mut guard = self.entries.lock();
+        let inner = &mut *guard;
+        let Some(map) = inner.tables.get_mut(table_name) else {
+            return false;
+        };
+        let existed = map.remove(key_bytes).is_some();
+        if map.is_empty() {
+            inner.tables.remove(table_name);
         }
-        false
+        if existed {
+            inner.len -= 1;
+        }
+        existed
     }
 
     /// Number of pending entries (unique keys across all tables).
     pub(crate) fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .unwrap()
-            .values()
-            .map(HashMap::len)
-            .sum()
+        self.entries.lock().len
     }
 
     /// Flush all pending entries to redb, grouped by table.
@@ -326,22 +385,22 @@ impl BufferStore {
     /// buffer so no data is lost (entries that were already written are
     /// re-inserted idempotently on the next attempt).
     pub(crate) fn flush(&self, db: &Database) -> Result<usize, DbError> {
-        let _flush_guard = self.flush_lock.lock().unwrap();
+        let _flush_guard = self.flush_lock.lock();
         // Sync related state (e.g., counters) before writing buffered data.
         // Clone the Arc so the mutex is not held during the callback.
-        let on_flush = self.on_flush.lock().unwrap().clone();
+        let on_flush = self.on_flush.lock().clone();
         if let Some(cb) = on_flush {
             cb()?;
         }
 
-        let mut entries = self.entries.lock().unwrap();
-        if entries.is_empty() {
+        let mut guard = self.entries.lock();
+        if guard.len == 0 {
             return Ok(0);
         }
-        let batch = std::mem::take(&mut *entries);
-        drop(entries);
+        let count = std::mem::take(&mut guard.len);
+        let batch = std::mem::take(&mut guard.tables);
+        drop(guard);
 
-        let count: usize = batch.values().map(HashMap::len).sum();
         let table_count = batch.len();
 
         // Commit through the configured policy: Durable opens a dedicated
@@ -354,16 +413,14 @@ impl BufferStore {
         // consumed by the closure can be put back into the buffer (data-loss
         // prevention).  `commit_ops` invokes the closure at most once.
         let targets = self.targets.clone();
-        let slot: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, TableEntries>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Some(batch)));
+        let slot: Arc<Mutex<Option<TableMap<TableEntries>>>> = Arc::new(Mutex::new(Some(batch)));
         let slot_for_closure = slot.clone();
-        let result = crate::group_commit::commit_ops(db, self.policy.get(), move |tx| {
+        let result = crate::group_commit::commit_ops(db, &self.policy, move |tx| {
             let taken = slot_for_closure
                 .lock()
-                .unwrap()
                 .take()
                 .expect("commit_ops invokes the closure at most once");
-            let targets = targets.lock().unwrap();
+            let targets = targets.lock();
             match (|| {
                 for (name, pairs) in &taken {
                     let target = targets.get(name).ok_or_else(|| {
@@ -378,7 +435,7 @@ impl BufferStore {
                 // Transaction is not committed (or, in grouped mode, the whole
                 // group rolls back) — hand the full batch back for a retry.
                 Err(e) => {
-                    *slot_for_closure.lock().unwrap() = Some(taken);
+                    *slot_for_closure.lock() = Some(taken);
                     Err(e)
                 }
             }
@@ -389,14 +446,18 @@ impl BufferStore {
             Err(e) => {
                 // Put back whatever the closure left behind (full batch on
                 // failure — the aborted transaction persisted none of it).
-                let leftover = slot.lock().unwrap().take();
+                let leftover = slot.lock().take();
                 if let Some(batch) = leftover {
-                    let mut entries = self.entries.lock().unwrap();
+                    let mut guard = self.entries.lock();
+                    let inner = &mut *guard;
                     for (name, pairs) in batch {
-                        let map = entries.entry(name).or_default();
+                        let map = inner.tables.entry(name).or_default();
+                        let before = map.len();
                         for (k, v) in pairs {
                             map.entry(k).or_insert(v);
                         }
+                        let added = map.len() - before;
+                        inner.len += added;
                     }
                 }
                 return Err(e);
@@ -869,5 +930,209 @@ mod tests {
     fn strip_varint_length_mismatch_returns_input() {
         let data = [7u8, 1, 2, 3, 4]; // claims 7, only 4 remain
         assert_eq!(strip_varint(&data), &data[..]);
+    }
+
+    /// A buffered TTL write must expire `ttl` after the *write*, not `ttl`
+    /// after the flush that happens to persist it.
+    #[test]
+    fn ttl_counts_from_write_time_not_flush_time() {
+        const TTL_T: TtlTableDefinition<u64, String> = TtlTableDefinition::new("ttl_from_write");
+        let (db, store, _dir) = setup();
+        store.register_ttl(TTL_T, Duration::from_secs(3600));
+
+        let k = serialize_value(&1u64);
+        let v = serialize_value(&"v".to_string());
+        store
+            .push_with_ttl(
+                "ttl_from_write",
+                k,
+                v,
+                &db,
+                false,
+                Some(Duration::from_millis(1500)),
+            )
+            .expect("push");
+        std::thread::sleep(Duration::from_millis(1000));
+        store.flush(&db).expect("flush");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let tx = db.begin_read().expect("read");
+        let table = tx.open_ttl_table(TTL_T).expect("open");
+        let guard = table.get(1u64).expect("get").expect("not yet expired");
+        let remaining = guard.expires_at_ms().saturating_sub(now_ms);
+        assert!(
+            remaining <= 800,
+            "TTL restarted at flush: {remaining} ms left of a 1500 ms TTL written 1000 ms ago"
+        );
+    }
+
+    // -- Flush order ---------------------------------------------------------
+
+    /// Like `setup()`, but without the 100-entry auto-flush: a test decides
+    /// when a batch is flushed.
+    fn setup_unbounded() -> (Arc<Database>, BufferStore, String) {
+        let (db, _store, dir) = setup();
+        let store = BufferStore::new(
+            0,
+            crate::group_commit::CommitPolicyCell::new(crate::group_commit::CommitPolicy::Durable),
+        );
+        store.register_regular(TEST_TABLE);
+        (db, store, dir)
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Entries pushed in random order, of several key types, all land in the
+    /// database intact: the key-ordered flush must use each table's own key
+    /// comparator, not byte order.
+    #[test]
+    fn flush_in_key_order_roundtrips_for_each_key_type() {
+        const U: TableDefinition<u64, String> = TableDefinition::new("ord_u64");
+        const S: TableDefinition<String, u64> = TableDefinition::new("ord_string");
+        const T: TableDefinition<(u32, u64), String> = TableDefinition::new("ord_tuple");
+        const I: TableDefinition<i64, u64> = TableDefinition::new("ord_i64");
+
+        let (db, store, _dir) = setup_unbounded();
+        store.register_regular(U);
+        store.register_regular(S);
+        store.register_regular(T);
+        store.register_regular(I);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut keys: Vec<u64> = (0..3_000).collect();
+        // Fisher-Yates with a fixed seed.
+        for i in (1..keys.len()).rev() {
+            let j = (xorshift(&mut rng) % (i as u64 + 1)) as usize;
+            keys.swap(i, j);
+        }
+        for k in &keys {
+            let signed = (*k as i64) - 1_500; // negative and positive keys
+            store
+                .push(
+                    U.name(),
+                    serialize_value(k),
+                    serialize_value(&format!("v{k}")),
+                    &db,
+                    false,
+                )
+                .unwrap();
+            store
+                .push(
+                    S.name(),
+                    serialize_value(&format!("key-{k:05}")),
+                    serialize_value(k),
+                    &db,
+                    false,
+                )
+                .unwrap();
+            store
+                .push(
+                    T.name(),
+                    serialize_value(&((*k % 7) as u32, *k)),
+                    serialize_value(&format!("t{k}")),
+                    &db,
+                    false,
+                )
+                .unwrap();
+            store
+                .push(
+                    I.name(),
+                    serialize_value(&signed),
+                    serialize_value(k),
+                    &db,
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.flush(&db).unwrap(), 4 * 3_000);
+
+        let tx = db.begin_read().unwrap();
+        let u = tx.open_table(U).unwrap();
+        let s = tx.open_table(S).unwrap();
+        let t = tx.open_table(T).unwrap();
+        let i = tx.open_table(I).unwrap();
+        use shodh_redb::{ReadableTable, ReadableTableMetadata};
+        for k in 0..3_000u64 {
+            assert_eq!(u.get(k).unwrap().unwrap().value(), format!("v{k}"));
+            assert_eq!(s.get(format!("key-{k:05}")).unwrap().unwrap().value(), k);
+            assert_eq!(
+                t.get(((k % 7) as u32, k)).unwrap().unwrap().value(),
+                format!("t{k}")
+            );
+            assert_eq!(i.get((k as i64) - 1_500).unwrap().unwrap().value(), k);
+        }
+        assert_eq!(u.len().unwrap(), 3_000);
+        let ordered: Vec<i64> = i.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+        assert!(
+            ordered.windows(2).all(|w| w[0] < w[1]),
+            "i64 keys out of order"
+        );
+    }
+
+    /// Sequential keys flushed batch after batch pack their leaves: this is
+    /// the case the key-ordered flush exists for.
+    #[test]
+    fn sequential_keys_across_flushes_pack_leaves() {
+        const U: TableDefinition<u64, Vec<u8>> = TableDefinition::new("pack_u64");
+        let (db, store, _dir) = setup_unbounded();
+        store.register_regular(U);
+
+        let value = serialize_value(&vec![7u8; 150]);
+        let mut next = 0u64;
+        for _ in 0..20 {
+            // Insert each batch in descending order: only the flush ordering
+            // can turn it into an ascending load.
+            for k in (next..next + 1_000).rev() {
+                store
+                    .push(U.name(), serialize_value(&k), value.clone(), &db, false)
+                    .unwrap();
+            }
+            next += 1_000;
+            store.flush(&db).unwrap();
+        }
+
+        use shodh_redb::ReadableTableMetadata;
+        let tx = db.begin_read().unwrap();
+        let t = tx.open_table(U).unwrap();
+        assert_eq!(t.len().unwrap(), 20_000);
+        let leaves = t.stats().unwrap().leaf_pages();
+        // ~150B values: ~25 entries per 4K page when packed => ~800 leaves;
+        // an even split of every leaf would need ~1600.
+        assert!(leaves < 1_000, "{leaves} leaves for 20_000 sequential rows");
+    }
+
+    /// An overwrite of a pending key inside a batch still keeps only the last
+    /// value after the ordered flush.
+    #[test]
+    fn ordered_flush_keeps_last_value_per_key() {
+        const U: TableDefinition<u64, String> = TableDefinition::new("last_wins");
+        let (db, store, _dir) = setup_unbounded();
+        store.register_regular(U);
+        for round in 0..5 {
+            for k in (0..500u64).rev() {
+                store
+                    .push(
+                        U.name(),
+                        serialize_value(&k),
+                        serialize_value(&format!("r{round}")),
+                        &db,
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.flush(&db).unwrap(), 500);
+        let tx = db.begin_read().unwrap();
+        let t = tx.open_table(U).unwrap();
+        for k in 0..500u64 {
+            assert_eq!(t.get(k).unwrap().unwrap().value(), "r4");
+        }
     }
 }

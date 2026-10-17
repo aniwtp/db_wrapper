@@ -2,7 +2,7 @@
 //! commit policies (Durable / Grouped / GroupedNonDurable).
 //!
 //! Run: cargo bench --bench commit_policy
-//! Env: POLICY_BENCH_N — writes per policy (default 100_000)
+//! Env: POLICY_BENCH_N — writes per policy (default 100_000), BENCH_DIR — data dir (default /var/tmp)
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,9 +11,11 @@ use std::time::Instant;
 use db_wrapper::{CommitPolicy, DBWrapper};
 
 fn dir_for(label: &str) -> PathBuf {
-    let dir = std::env::current_dir()
-        .expect("cwd")
-        .join("target")
+    // Real disk by default (/var/tmp is ext4 here, /tmp is tmpfs where fsync
+    // is free).  Override with BENCH_DIR.
+    let dir = std::env::var_os("BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"))
         .join(format!("commit_bench_{label}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();

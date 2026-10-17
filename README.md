@@ -35,17 +35,30 @@ db.flush_buffers()?;
 
 ## Benchmarks
 
-| Operation | Latency | Throughput |
-|---|---|---|
-| `next(id)` (counter) | 8.4 ns | 119M /s |
-| `next(id)` during flush | 8.7 ns | 115M /s |
-| Buffer hit (`get_buffered`) | 33 ns | 30M /s |
-| Buffer miss → DB read | 739 ns | 1.35M /s |
-| Raw DB read | 683 ns | 1.46M /s |
-| Restore 256 counters | 733 µs | — |
-| Write 1000 + flush | 2.4 ms | — |
+Measured on ext4 (real fsync), 16 threads, shodh-redb 0.6, `cargo bench`
+(data dir `/var/tmp`, override with `BENCH_DIR`):
 
-Run: `cargo bench`
+| Operation | Latency |
+|---|---|
+| `next(id)` (counter) | 1.6 ns |
+| `next(id)` ×4 threads, distinct ids (800k ops) | 0.39 ms total |
+| Buffer hit (`get_buffered`) | 25 ns |
+| `get()` — buffer hit / DB hit | 32 ns / 393 ns |
+| `write()` overwriting a pending key | 30 ns |
+| `write_ttl()` (buffered) | 44 ns |
+| Raw DB read | 353 ns |
+| Flush 9000 entries (no fsync) | 6.2 ms |
+| Open + restore 256 counters + close | 13.5 ms (2 × ~3.3 ms is redb `Database` drop) |
+
+End to end (500k rows of 200 B, flushed in 10k batches, fork vs. the original crate on
+shodh-redb 0.5): insert 880 -> 585 ms, overwrite 900 -> 470 ms, peak RSS 227 -> 163 MB;
+`commit_policy` per write: Durable 1.63 -> 1.12 us, Grouped 1.58 -> 1.03 us,
+GroupedNonDurable 1.30 -> 0.82 us.
+
+`shodh-redb` comes from the `umzi2/shodh-redb-fork` branch `perf/upstream-port` (see
+`Cargo.toml`): the key-ordered flush needs its ascending-insert leaf packing.
+
+Run: `cargo bench` (`--bench commit_policy` for the commit-policy comparison)
 
 ## License
 

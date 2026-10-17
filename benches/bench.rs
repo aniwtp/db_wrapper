@@ -12,8 +12,14 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use db_wrapper::DBWrapper;
 
+/// Bench data lives on a real disk by default (`/var/tmp`), not tmpfs:
+/// on tmpfs fsync is free and commit costs are invisible.  Override with
+/// `BENCH_DIR`.
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("teamdb_bench_{label}"));
+    let base = std::env::var_os("BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+    let dir = base.join(format!("teamdb_bench_{label}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -180,6 +186,34 @@ fn bench_buffer_write_overwrite(c: &mut Criterion) {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn bench_buffer_write_new_keys(c: &mut Criterion) {
+    use shodh_redb::TableDefinition;
+    const T: TableDefinition<u64, String> = TableDefinition::new("bench_newkeys");
+
+    let dir = temp_dir("buffer_newkeys");
+    let db = open_db(&dir);
+    db.register_table(T);
+
+    let mut g = c.benchmark_group("4-buffer");
+    g.throughput(Throughput::Elements(5_000));
+    g.bench_function("write 5000 new keys (no flush)", |b| {
+        // Setup drains the buffer (untimed) so every timed write inserts a
+        // brand-new key.
+        b.iter_batched(
+            || db.flush_buffers().expect("flush"),
+            |()| {
+                for i in 0u64..5_000 {
+                    db.write(T, i, "value".to_string()).expect("write");
+                }
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+    g.finish();
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn bench_buffer_flush_9000(c: &mut Criterion) {
     use shodh_redb::TableDefinition;
     const T: TableDefinition<u64, String> = TableDefinition::new("bench_flush9k");
@@ -200,6 +234,46 @@ fn bench_buffer_flush_9000(c: &mut Criterion) {
             },
             |db| db.flush_buffers().expect("flush"),
             criterion::BatchSize::SmallInput,
+        );
+    });
+    g.finish();
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// CPU-side flush cost: `GroupedNonDurable` commits without fsync, so disk
+/// latency noise does not hide the cost of the B-tree inserts themselves.
+fn bench_buffer_flush_nofsync(c: &mut Criterion) {
+    use shodh_redb::TableDefinition;
+    const T: TableDefinition<u64, String> = TableDefinition::new("bench_flush_nofsync");
+
+    let dir = temp_dir("buffer_flush_nofsync");
+    let db = DBWrapper::with_commit_policy(
+        dir.join("bench.redb").to_str().unwrap(),
+        db_wrapper::CommitPolicy::GroupedNonDurable,
+    )
+    .expect("open");
+    db.register_table(T);
+
+    let mut g = c.benchmark_group("4-buffer");
+    g.throughput(Throughput::Elements(9_000));
+    g.bench_function("flush 9000 entries, no fsync", |b| {
+        b.iter_batched(
+            || {
+                // Random-looking key order: a hash-ordered batch must be
+                // inserted correctly regardless of arrival order.
+                for i in 0u64..9_000 {
+                    db.write(
+                        T,
+                        i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40,
+                        format!("value_{i}"),
+                    )
+                    .expect("write");
+                }
+                &db
+            },
+            |db| db.flush_buffers().expect("flush"),
+            criterion::BatchSize::PerIteration,
         );
     });
     g.finish();
@@ -363,7 +437,7 @@ fn bench_remove_buffered(c: &mut Criterion) {
                 &db
             },
             |db| db.remove(T, 1u64).expect("remove"),
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         );
     });
     g.finish();
@@ -381,13 +455,15 @@ fn bench_counter_flush(c: &mut Criterion) {
     let mut g = c.benchmark_group("7-counter-flush");
     g.throughput(Throughput::Elements(1));
     g.bench_function("flush_counters after next()", |b| {
+        // PerIteration: every flush must see a dirty counter, otherwise
+        // all but the first flush of a batch are no-ops.
         b.iter_batched(
             || {
                 db.next(0);
                 &db
             },
             |db| db.flush_counters().expect("flush"),
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         );
     });
     g.finish();
@@ -445,6 +521,154 @@ fn bench_compact(c: &mut Criterion) {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// -- 10. Multi-threaded -----------------------------------------------------
+
+const MT_THREADS: usize = 4;
+const MT_OPS: u64 = 200_000;
+
+/// Run `f(thread_idx)` on `MT_THREADS` threads, return wall time of the
+/// slowest start→finish span.
+fn run_threads<F>(f: F) -> Duration
+where
+    F: Fn(usize) + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    let barrier = Arc::new(std::sync::Barrier::new(MT_THREADS + 1));
+    let handles: Vec<_> = (0..MT_THREADS)
+        .map(|i| {
+            let f = f.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                f(i);
+            })
+        })
+        .collect();
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_mt_counters(c: &mut Criterion) {
+    let dir = temp_dir("mt_counters");
+    let db = Arc::new(open_db(&dir));
+
+    let mut g = c.benchmark_group("10-mt");
+    g.throughput(Throughput::Elements(MT_THREADS as u64 * MT_OPS));
+    g.bench_function("next() 4 threads, distinct ids", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let db = db.clone();
+                total += run_threads(move |i| {
+                    for _ in 0..MT_OPS {
+                        black_box(db.next(black_box(i as u8)));
+                    }
+                });
+            }
+            total
+        });
+    });
+    g.finish();
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn bench_mt_buffer(c: &mut Criterion) {
+    use shodh_redb::TableDefinition;
+    const T: TableDefinition<u64, String> = TableDefinition::new("bench_mt");
+
+    let dir = temp_dir("mt_buffer");
+    let db = Arc::new(open_db(&dir));
+    db.register_table(T);
+    for i in 0u64..5_000 {
+        db.write(T, i, format!("value_{i}")).expect("write");
+    }
+
+    let mut g = c.benchmark_group("10-mt");
+    g.throughput(Throughput::Elements(MT_THREADS as u64 * 50_000));
+    g.bench_function("get() buffer hit, 4 threads", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let db = db.clone();
+                total += run_threads(move |i| {
+                    for n in 0..50_000u64 {
+                        black_box(db.get(T, (n + i as u64) % 5_000).unwrap());
+                    }
+                });
+            }
+            total
+        });
+    });
+    g.bench_function("write() overwrite, 4 threads", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let db = db.clone();
+                total += run_threads(move |i| {
+                    for n in 0..50_000u64 {
+                        db.write(T, (n + i as u64) % 5_000, "v".to_string())
+                            .unwrap();
+                    }
+                });
+            }
+            total
+        });
+    });
+    g.finish();
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// -- 11. Many tables --------------------------------------------------------
+
+fn bench_many_tables_push(c: &mut Criterion) {
+    use shodh_redb::TableDefinition;
+    const T0: TableDefinition<u64, String> = TableDefinition::new("mt_t0");
+    const T1: TableDefinition<u64, String> = TableDefinition::new("mt_t1");
+    const T2: TableDefinition<u64, String> = TableDefinition::new("mt_t2");
+    const T3: TableDefinition<u64, String> = TableDefinition::new("mt_t3");
+    const T4: TableDefinition<u64, String> = TableDefinition::new("mt_t4");
+    const T5: TableDefinition<u64, String> = TableDefinition::new("mt_t5");
+    const T6: TableDefinition<u64, String> = TableDefinition::new("mt_t6");
+    const T7: TableDefinition<u64, String> = TableDefinition::new("mt_t7");
+
+    let dir = temp_dir("many_tables");
+    let db = open_db(&dir);
+    db.register_table(T0);
+    db.register_table(T1);
+    db.register_table(T2);
+    db.register_table(T3);
+    db.register_table(T4);
+    db.register_table(T5);
+    db.register_table(T6);
+    db.register_table(T7);
+    // Pre-seed every table so the per-write cost reflects 8 live tables.
+    for i in 0u64..100 {
+        db.write(T0, i, "v".into()).unwrap();
+        db.write(T1, i, "v".into()).unwrap();
+        db.write(T2, i, "v".into()).unwrap();
+        db.write(T3, i, "v".into()).unwrap();
+        db.write(T4, i, "v".into()).unwrap();
+        db.write(T5, i, "v".into()).unwrap();
+        db.write(T6, i, "v".into()).unwrap();
+        db.write(T7, i, "v".into()).unwrap();
+    }
+
+    let mut g = c.benchmark_group("11-many-tables");
+    g.throughput(Throughput::Elements(1));
+    g.bench_function("write() overwrite, 8 live tables", |b| {
+        b.iter(|| db.write(T3, black_box(7u64), "v".to_string()).unwrap());
+    });
+    g.finish();
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 criterion_group!(
     benches,
     bench_next_hot,
@@ -453,7 +677,9 @@ criterion_group!(
     bench_restore,
     bench_buffer_write_flush,
     bench_buffer_write_overwrite,
+    bench_buffer_write_new_keys,
     bench_buffer_flush_9000,
+    bench_buffer_flush_nofsync,
     bench_read_buffer_hit,
     bench_read_buffer_hit_10k,
     bench_read_db_miss,
@@ -463,5 +689,8 @@ criterion_group!(
     bench_counter_flush,
     bench_write_ttl,
     bench_compact,
+    bench_mt_counters,
+    bench_mt_buffer,
+    bench_many_tables_push,
 );
 criterion_main!(benches);
